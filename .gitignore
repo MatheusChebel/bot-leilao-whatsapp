@@ -1,0 +1,14 @@
+# Dependências
+node_modules/
+
+# Autenticação Baileys (NUNCA versionar)
+auth_info/
+
+# Credenciais Google (NUNCA versionar)
+credentials.json
+
+# Variáveis de ambiente
+.env
+
+# Logs locais
+*.log
