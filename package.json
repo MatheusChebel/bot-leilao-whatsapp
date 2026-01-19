@@ -1,9 +1,11 @@
 {
+  
   "name": "bot-leilao",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
+    "start": "node index.js",
     "test": "node test/step5.test.js"
   },
   "dependencies": {
@@ -11,4 +13,5 @@
     "googleapis": "^132.0.0",
     "qrcode-terminal": "^0.12.0"
   }
+  
 }
