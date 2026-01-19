@@ -54,10 +54,40 @@ function parseAutoGoto(text) {
   return { pos };
 }
 
+// !leilao espec <id1> <id2> ... <tempo>
+// Ex: !leilao espec 1 6 9 10 25 10m
+// - sem limite de quantidade de ids
+// - último argumento deve ser o tempo (30s/10m/1h)
+// - ids devem ser números inteiros positivos
+function parseLeilaoEspec(text) {
+  const s = String(text || "").trim();
+  if (!/^!leilao\s+espec\b/i.test(s)) return null;
+
+  // Mantém a flexibilidade (múltiplos espaços).
+  const parts = s.split(/\s+/);
+  // parts[0]=!leilao, parts[1]=espec
+  if (parts.length < 4) return null; // precisa: !leilao espec <id> <tempo>
+
+  const rawTempo = parts[parts.length - 1];
+  const duracaoMs = tempoMs(rawTempo);
+  if (!duracaoMs) return null;
+
+  const ids = [];
+  for (let i = 2; i < parts.length - 1; i++) {
+    const n = parseInt(parts[i], 10);
+    if (Number.isNaN(n) || n <= 0) return null;
+    ids.push(n);
+  }
+
+  if (ids.length === 0) return null;
+  return { ids, duracaoMs, rawTempo };
+}
+
 module.exports = {
   tempoMs,
   parseAutoIniciar,
   parseManualIniciar,
   parseAutoSetDuracao,
-  parseAutoGoto
+  parseAutoGoto,
+  parseLeilaoEspec
 };

@@ -7,6 +7,7 @@ const { loadState, saveState, clearState } = require("./state");
 const {
   tempoMs,
   parseAutoIniciar,
+  parseLeilaoEspec,
   parseManualIniciar,
   parseAutoSetDuracao,
   parseAutoGoto
@@ -43,10 +44,13 @@ function extrairTexto(m) {
   ).trim();
 }
 
-// Extrai primeiro inteiro do texto: "30", "R$30", "lance 30", "30 reais"
-function extrairNumero(texto) {
+// Extrai lance padronizado: exige a letra L (ou l) antes do número.
+// Aceita: "L20", "l20", "L 20", "l  20".
+// Rejeita: números soltos e textos aleatórios para evitar lances acidentais.
+function extrairLance(texto) {
   if (!texto) return null;
-  const match = String(texto).match(/(\d{1,9})/);
+  const s = String(texto).trim();
+  const match = s.match(/^l\s*(\d{1,9})\s*$/i);
   if (!match) return null;
   const n = parseInt(match[1], 10);
   return Number.isNaN(n) ? null : n;
@@ -58,6 +62,102 @@ function isGrupo(jid) {
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+const TEXTO_COMO_DAR_LANCE =
+`📌 *Como dar lance (novo padrão)*\n\nPara evitar lances acidentais, os lances agora precisam começar com a letra *L*.\n\n✅ Exemplos válidos:\n• *L20*\n• *l20*\n• *L 20*\n• *l  20*\n\nApenas mensagens nesse formato serão consideradas lances.`;
+
+async function enviarComoDarLance(sock, chatId) {
+  await sock.sendMessage(chatId, { text: TEXTO_COMO_DAR_LANCE });
+}
+
+// =====================================================
+// MARCAR TODOS (MENTION ALL)
+// =====================================================
+async function isAdmin(sock, chatId, senderId) {
+  try {
+    if (!isGrupo(chatId)) return false;
+    const meta = await sock.groupMetadata(chatId);
+    const ps = Array.isArray(meta?.participants) ? meta.participants : [];
+    const me = ps.find(p => p?.id === senderId);
+    if (!me) return false;
+    return me.admin === "admin" || me.admin === "superadmin";
+  } catch {
+    return false;
+  }
+}
+
+async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
+  if (!isGrupo(chatId)) {
+    await sock.sendMessage(chatId, { text: "⚠️ Use !marcar dentro do grupo." });
+    return { ok: false, motivo: "nao_grupo" };
+  }
+
+  const admin = await isAdmin(sock, chatId, senderId);
+  if (!admin) {
+    await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !marcar." });
+    return { ok: false, motivo: "nao_admin" };
+  }
+
+  let meta;
+  try {
+    meta = await sock.groupMetadata(chatId);
+  } catch (e) {
+    await sock.sendMessage(chatId, { text: "⚠️ Não consegui ler os membros do grupo agora. Tente novamente." });
+    await log("warn", "MARCAR_FAIL_META", {
+      chatId,
+      usuario: pushName || "ADM",
+      detalhes: { message: e?.message || String(e) }
+    });
+    return { ok: false, motivo: "meta_fail" };
+  }
+
+  const participantes = Array.isArray(meta?.participants) ? meta.participants : [];
+  const ids = participantes.map(p => p?.id).filter(Boolean);
+
+  if (!ids.length) {
+    await sock.sendMessage(chatId, { text: "⚠️ Não encontrei participantes para marcar." });
+    return { ok: false, motivo: "vazio" };
+  }
+
+  const CHUNK = 50;
+  const total = ids.length;
+  const baseTexto =
+    "📣 *ATENÇÃO!* O leilão vai começar em instantes.\n" +
+    "Preparem seus lances e fiquem de olho nas mensagens.";
+
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const tags = chunk.map(jid => `@${String(jid).split("@")[0]}`).join(" ");
+    const texto = i === 0
+      ? `${baseTexto}\n\n${tags}`
+      : `📣 Continuação (${Math.min(i + CHUNK, total)}/${total})\n${tags}`;
+
+    await sock.sendMessage(chatId, { text: texto, mentions: chunk });
+    if (i + CHUNK < ids.length) await sleep(600);
+  }
+
+  await log("info", "MARCAR", {
+    chatId,
+    usuario: pushName || "ADM",
+    detalhes: { totalMarcados: total }
+  });
+
+  return { ok: true, total };
+}
+
+// Mensagem de instrução sobre lances (novo padrão)
+function textoInstrucaoLance() {
+  return (
+`📌 *Como dar lance (novo padrão)*\n\n` +
+`Para evitar lances acidentais, os lances agora precisam começar com a letra *L*.\n\n` +
+`✅ Exemplos válidos:\n` +
+`• *L20*\n` +
+`• *l20*\n` +
+`• *L 20*\n` +
+`• *l  20*\n\n` +
+`Apenas mensagens nesse formato serão consideradas lances.`
+  );
 }
 
 function clampMin(n, min) {
@@ -132,6 +232,8 @@ const estadoInicial = () => ({
   chatId: null,
 
   timer: null,
+  warn2mTimer: null,
+  warn10sTimer: null,
   inicioMs: null,
   restanteMs: null,
   finalizarPromise: null,
@@ -180,6 +282,8 @@ function persist() {
       pausado: true,
       // referências de runtime não devem ir para o state.json
       timer: null,
+      warn2mTimer: null,
+      warn10sTimer: null,
       finalizarPromise: null
     };
   }
@@ -191,14 +295,55 @@ function persist() {
 // =====================================================
 // TIMER (LEILÃO ATUAL)
 // =====================================================
-function iniciarTimer(finalizar) {
+function iniciarTimer(sock, chatId, finalizar) {
   st.inicioMs = Date.now();
   st.timer = setTimeout(finalizar, st.restanteMs);
+  // avisos de tempo (2 min / 10s)
+  try { agendarAvisosTempo(sock, chatId); } catch {}
+}
+
+function limparAvisosTempo() {
+  if (st.warn2mTimer) clearTimeout(st.warn2mTimer);
+  if (st.warn10sTimer) clearTimeout(st.warn10sTimer);
+  st.warn2mTimer = null;
+  st.warn10sTimer = null;
+}
+
+function agendarAvisosTempo(sock, chatId) {
+  limparAvisosTempo();
+  if (!st.ativo || st.pausado) return;
+
+  const p = st.produto;
+  const dur = Number(st.restanteMs);
+  if (!Number.isFinite(dur) || dur <= 0) return;
+
+  // aviso de 2 minutos
+  if (dur > 2 * 60 * 1000) {
+    st.warn2mTimer = setTimeout(async () => {
+      if (!st.ativo || st.pausado || st.chatId !== chatId) return;
+      await sock.sendMessage(chatId, {
+        text:
+`⏳ *Faltam 2 minutos!*\n\n📦 ${nomeProduto(p)}\n💰 Lance atual: *R$${st.maiorLance}*\n✅ Lance padronizado: *L<valor>* (ex: *L20*)`
+      });
+    }, dur - 2 * 60 * 1000);
+  }
+
+  // aviso de 10 segundos
+  if (dur > 10 * 1000) {
+    st.warn10sTimer = setTimeout(async () => {
+      if (!st.ativo || st.pausado || st.chatId !== chatId) return;
+      await sock.sendMessage(chatId, {
+        text:
+`⏰ *ÚLTIMOS 10 SEGUNDOS!*\n\n📦 ${nomeProduto(p)}\n💰 Lance atual: *R$${st.maiorLance}*\n✅ Lance padronizado: *L<valor>* (ex: *L20*)`
+      });
+    }, dur - 10 * 1000);
+  }
 }
 
 function pausarLeilaoAtual() {
   if (!st.ativo || st.pausado) return false;
   clearTimeout(st.timer);
+  limparAvisosTempo();
   const passou = Date.now() - st.inicioMs;
   st.restanteMs = clampMin(st.restanteMs - passou, 0);
   st.pausado = true;
@@ -206,10 +351,10 @@ function pausarLeilaoAtual() {
   return true;
 }
 
-function retomarLeilaoAtual() {
+function retomarLeilaoAtual(sock, chatId) {
   if (!st.ativo || !st.pausado) return false;
   st.pausado = false;
-  iniciarTimer(st.finalizarPromise);
+  iniciarTimer(sock, chatId, st.finalizarPromise);
   persist();
   return true;
 }
@@ -217,6 +362,7 @@ function retomarLeilaoAtual() {
 function encerrarLeilaoAtualAgora() {
   if (!st.ativo) return;
   clearTimeout(st.timer);
+  limparAvisosTempo();
   try { st.finalizarPromise?.(); } catch {}
 }
 
@@ -228,6 +374,7 @@ function cancelarLeilaoAtual() {
   }
 
   clearTimeout(st.timer);
+  limparAvisosTempo();
   try { st.finalizarPromise?.(); } catch {}
 
   st.ativo = false;
@@ -239,6 +386,8 @@ function cancelarLeilaoAtual() {
   st.leilaoFromAuto = false;
 
   st.timer = null;
+  st.warn2mTimer = null;
+  st.warn10sTimer = null;
   st.inicioMs = null;
   st.restanteMs = null;
   st.finalizarPromise = null;
@@ -323,6 +472,11 @@ async function executarLeilao(sock, chatId, produto, duracaoMs, opts = {}) {
     }
   });
 
+  const sendIntro = (opts.sendIntro ?? !opts.fromAuto);
+  if (sendIntro) {
+    await enviarComoDarLance(sock, chatId);
+  }
+
   await sock.sendMessage(chatId, {
     image: { url: produto.imagem },
     caption:
@@ -334,12 +488,12 @@ async function executarLeilao(sock, chatId, produto, duracaoMs, opts = {}) {
 🎯 Arremate: *${arremate ? `R$${arremate}` : "-"}*
 ⏳ Duração: *${Math.ceil(duracaoMs / 60000)} min*
 
-Envie um lance (ex: 30 / "lance 30" / "R$30").`
+Envie seu lance no formato: *L<valor>* (ex: *L20*).`
   });
 
   await new Promise(resolve => {
     st.finalizarPromise = resolve;
-    iniciarTimer(resolve);
+    iniciarTimer(sock, chatId, resolve);
   });
 
   // Se foi cancelado ou resetado, sai
@@ -357,6 +511,8 @@ Envie um lance (ex: 30 / "lance 30" / "R$30").`
   st.pausado = false;
   st.produto = null;
   st.timer = null;
+  st.warn2mTimer = null;
+  st.warn10sTimer = null;
   st.inicioMs = null;
   st.restanteMs = null;
   st.finalizarPromise = null;
@@ -637,6 +793,101 @@ async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs)
 }
 
 // =====================================================
+// AUTOMÁTICO (SEQUÊNCIA) - ESPECÍFICO POR LISTA DE IDS
+// =====================================================
+// !leilao espec <id1> <id2> ... <tempo>
+// Ex: !leilao espec 1 6 9 10 25 10m
+async function iniciarSequenciaAutomaticaEspec(sock, chatId, ids, duracaoMs) {
+  if (st.ativo) {
+    await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+    return;
+  }
+  if (st.sequenciaAtiva) {
+    await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
+    return;
+  }
+
+  const lista = Array.isArray(ids) ? ids : [];
+  if (lista.length === 0) {
+    await sock.sendMessage(chatId, { text: "⚠️ Informe ao menos 1 ID." });
+    return;
+  }
+
+  // Monta a fila APENAS com itens que existem e possuem estoque (>0) no momento do start.
+  // Mantém a ordem exata informada no comando.
+  const fila = [];
+  const ignorados = [];
+
+  for (const id of lista) {
+    const p = await getProdutoById(id);
+    if (p && Number(p.estoque) > 0) {
+      fila.push(id);
+    } else {
+      ignorados.push(id);
+    }
+  }
+
+  if (fila.length === 0) {
+    await sock.sendMessage(chatId, { text: "⚠️ Nenhum dos IDs informados tem estoque disponível no momento. Sequência não iniciada." });
+    await log("warn", "AUTO_ESPEC_START_EMPTY", {
+      chatId,
+      usuario: "ADM",
+      detalhes: { totalInformados: lista.length, ids: lista, ignorados, duracaoMs }
+    });
+    return;
+  }
+
+  st.sequenciaAtiva = true;
+  st.sequenciaPausada = false;
+  st.filaIds = fila;
+  st.idx = 0;
+  st.duracaoMs = duracaoMs;
+  st.autoChatId = chatId;
+  st.ultimoChatId = chatId;
+  persist();
+
+  await log("auction", "AUTO_ESPEC_START", {
+    chatId,
+    usuario: "ADM",
+    detalhes: {
+      ids: lista,
+      totalElegiveis: fila.length,
+      totalIgnorados: ignorados.length,
+      ignorados,
+      duracaoMs
+    }
+  });
+
+  const tempoMin = Math.ceil(duracaoMs / 60000);
+  let msg = `🤖 Sequência automática (espec) iniciada: *${fila.length}* item(ns) (${tempoMin} min cada).`;
+  if (ignorados.length) {
+    const preview = ignorados.slice(0, 12).join(", ");
+    msg += `\n⚠️ Ignorados (inativo/sem estoque): ${preview}${ignorados.length > 12 ? "..." : ""}`;
+  }
+  await sock.sendMessage(chatId, { text: msg });
+
+  runSequenciaLoop(sock, chatId).catch(async (e) => {
+    console.error("❌ Erro no automático (espec):", e);
+
+    await log("error", "ERROR_AUTO_ESPEC", {
+      chatId,
+      usuario: "BOT",
+      detalhes: { message: e?.message || String(e) }
+    });
+
+    st.sequenciaAtiva = false;
+    st.sequenciaPausada = false;
+    st.filaIds = [];
+    st.idx = 0;
+    st.duracaoMs = null;
+    st.autoChatId = null;
+    persist();
+
+    await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
+  });
+}
+
+// =====================================================
 // HANDLER DE MENSAGENS
 // =====================================================
 function registrarHandlers(sock) {
@@ -663,6 +914,11 @@ function registrarHandlers(sock) {
         return;
       }
 
+      if (text === "!marcar") {
+        await marcarTodosNoGrupo(sock, chatId, senderId, pushName);
+        return;
+      }
+
       if (text === "!help" || text === "!ajuda") {
         await sock.sendMessage(chatId, {
           text: `📌 *Comandos do Bot de Leilões*
@@ -670,6 +926,7 @@ function registrarHandlers(sock) {
 🧾 Gerais
 • !help / !ajuda
 • !ping
+• !marcar  _(ADM: marca todos para avisar do início do leilão)_
 
 📊 Status
 • !status
@@ -688,12 +945,12 @@ function registrarHandlers(sock) {
 🤖 Sequência Automática (ADM)
 • !leilao auto iniciar <id_inicial> a <id_final> <tempo>
    Ex: !leilao auto iniciar 1 a 30 15m
+• !leilao espec <id1> <id2> ... <tempo>
+   Ex: !leilao espec 1 6 9 10 25 10m
 • !leilao auto setduracao <tempo>
    Ex: !leilao auto setduracao 10m
 • !leilao auto goto <posicao>
    Ex: !leilao auto goto 12
-• !leilao auto pular prox
-• (removido) !leilao auto voltar  → use !leilao auto goto <posicao>
 
 🔁 Recuperação após reinício (ADM)
 • !retomar
@@ -734,7 +991,7 @@ function registrarHandlers(sock) {
       // CONTROLES DO AUTOMÁTICO (permitir mesmo durante leilão)
       // -------------------------------------------------
       // Observação: durante a sequência automática, comandos como
-      // !leilao auto goto/pular/voltar/setduracao devem funcionar
+      // !leilao auto goto/setduracao devem funcionar
       // mesmo com um leilão ativo, pois afetam o PRÓXIMO item.
       //
       // Também tratamos !leilao cancelar como “cancelar a operação toda”
@@ -822,49 +1079,7 @@ function registrarHandlers(sock) {
         return;
       }
 
-      if (text.toLowerCase() === "!leilao auto pular prox" || text.toLowerCase() === "!leilao auto pular" ) {
-        const admin = await isAdmin(sock, chatId, senderId);
-        if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode pular item no automático." });
-          return;
-        }
-        if (!st.sequenciaAtiva) {
-          await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
-          return;
-        }
-
-        if (text.toLowerCase() === "!leilao auto pular") {
-          await sock.sendMessage(chatId, { text: "ℹ️ Comando atualizado: use *!leilao auto pular prox* (este ainda funciona como atalho)." });
-        }
-
-        const total = Array.isArray(st.filaIds) ? st.filaIds.length : 0;
-        if (!total) {
-          await sock.sendMessage(chatId, { text: "⚠️ State inválido (fila vazia)." });
-          return;
-        }
-
-        const before = st.idx;
-        st.idx = Math.min(st.idx + 1, total);
-        st.autoChatId = chatId;
-        st.ultimoChatId = chatId;
-        persist();
-
-        await log("warn", "AUTO_SKIP_MANUAL", {
-          chatId,
-          usuario: pushName,
-          detalhes: { before, after: st.idx, total, during: true }
-        });
-        const proximo = Math.min(st.idx + 1, total);
-        await sock.sendMessage(chatId, { text: `⏭️ Próximo item ajustado. Agora: ${proximo}/${total}. _(aplica no próximo item)_` });
-        return;
-      }
-
-      if (text === "!leilao auto voltar") {
-        await sock.sendMessage(chatId, { text: "ℹ️ O comando *!leilao auto voltar* foi removido. Use *!leilao auto goto <posicao>* para ir para uma posição específica." });
-        return;
-      }
-
-
+      
 
       // Pular IMEDIATAMENTE o item atual (somente em leilão automático)
       if (text.toLowerCase() === "!leilao pular") {
@@ -949,7 +1164,7 @@ function registrarHandlers(sock) {
           await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode despausar o leilão." });
           return;
         }
-        if (!retomarLeilaoAtual()) {
+        if (!retomarLeilaoAtual(sock, chatId)) {
           await sock.sendMessage(chatId, { text: "⚠️ Leilão não está pausado." });
           return;
         }
@@ -980,7 +1195,7 @@ function registrarHandlers(sock) {
         return;
       }
 
-      const lance = extrairNumero(text);
+      const lance = extrairLance(text);
       if (lance !== null) {
         const p = st.produto;
         const arremate = Number.isFinite(p.arremate) ? p.arremate : 0;
@@ -1068,6 +1283,7 @@ function registrarHandlers(sock) {
 🔎 Gerais
 • !help
 • !ping
+• !marcar  _(ADM: marca todos para avisar do início do leilão)_
 
 📋 Status
 • !status
@@ -1086,12 +1302,12 @@ function registrarHandlers(sock) {
 🤖 Sequência Automática (ADM)
 • !leilao auto iniciar <id_inicial> a <id_final> <tempo>
    Ex: !leilao auto iniciar 1 a 30 15m
+• !leilao espec <id1> <id2> ... <tempo>
+   Ex: !leilao espec 1 6 9 10 25 10m
 • !leilao auto setduracao <tempo>
    Ex: !leilao auto setduracao 10m
 • !leilao auto goto <posicao>
    Ex: !leilao auto goto 12
-• !leilao auto pular prox
-• (removido) !leilao auto voltar  → use !leilao auto goto <posicao>
 
 🔁 Recuperação após reinício (ADM)
 • !retomar
@@ -1108,6 +1324,11 @@ function registrarHandlers(sock) {
 
     if (text === "!status" || text === "!leilao status") {
       await sock.sendMessage(chatId, { text: statusTexto() });
+      return;
+    }
+
+    if (text === "!marcar") {
+      await marcarTodosNoGrupo(sock, chatId, senderId, pushName);
       return;
     }
 
@@ -1270,41 +1491,55 @@ Use:
       return;
     }
 
-    if (text.toLowerCase() === "!leilao auto pular prox" || text.toLowerCase() === "!leilao auto pular" ) {
+    // iniciar automático (lista específica de IDs)
+    const espec = parseLeilaoEspec(text);
+    if (espec) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode pular item no automático." });
-        return;
-      }
-      if (!st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
+        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode iniciar leilão automático (espec)." });
         return;
       }
 
-      const total = Array.isArray(st.filaIds) ? st.filaIds.length : 0;
-      if (!total) {
-        await sock.sendMessage(chatId, { text: "⚠️ State inválido (fila vazia)." });
+      if (st.ativo) {
+        await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+        return;
+      }
+      if (st.sequenciaAtiva) {
+        await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
         return;
       }
 
-      const before = st.idx;
-      st.idx = Math.min(st.idx + 1, total);
-      st.autoChatId = chatId;
+      if (!espec.duracaoMs) {
+        await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
+        return;
+      }
+
       st.ultimoChatId = chatId;
       persist();
 
-      await log("warn", "AUTO_SKIP_MANUAL", {
+      await log("auction", "AUTO_ESPEC_CMD_INICIAR", {
         chatId,
         usuario: pushName,
-        detalhes: { before, after: st.idx, total }
+        detalhes: { ids: espec.ids, duracaoMs: espec.duracaoMs }
       });
 
-      await sock.sendMessage(chatId, { text: `⏭️ Item pulado. Próximo: ${Math.min(st.idx + 1, total)}/${total}.` });
-      return;
-    }
+      // Envia instruções de lance apenas ao iniciar a sequência (não a cada item)
+      await enviarComoDarLance(sock, chatId);
 
-    if (text === "!leilao auto voltar") {
-      await sock.sendMessage(chatId, { text: "ℹ️ O comando *!leilao auto voltar* foi removido. Use *!leilao auto goto <posicao>* para ir para uma posição específica." });
+      iniciarSequenciaAutomaticaEspec(sock, chatId, espec.ids, espec.duracaoMs).catch(async (e) => {
+        console.error("❌ Erro no automático (espec):", e);
+
+        await log("error", "ERROR_AUTO_ESPEC", {
+          chatId,
+          usuario: "BOT",
+          detalhes: { message: e?.message || String(e) }
+        });
+
+        st.sequenciaAtiva = false;
+        st.sequenciaPausada = false;
+        await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
+      });
+
       return;
     }
 
@@ -1347,6 +1582,9 @@ Use:
         usuario: pushName,
         detalhes: { idIni, idFim, duracaoMs: dur }
       });
+
+      // Envia instruções de lance apenas ao iniciar a sequência (não a cada item)
+      await enviarComoDarLance(sock, chatId);
 
       iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, dur).catch(async (e) => {
         console.error("❌ Erro no automático:", e);
