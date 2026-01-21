@@ -51,8 +51,8 @@ function loadConfig() {
   const credentialsPath = resolvePathMaybe(credentialsRaw || "./credentials.json", cwd);
 
   const produtosRange = (process.env.PRODUTOS_RANGE || "Página1!A2:K").trim();
-  const vendasRange = (process.env.VENDASLOG_RANGE || "VendasLog!A2:G").trim();
-  const eventosRange = (process.env.EVENTOSLOG_RANGE || "EventosLog!A2:G").trim();
+  const vendasRange = (process.env.VENDASLOG_RANGE || "VendasLog!A2:H").trim();
+  const eventosRange = (process.env.EVENTOSLOG_RANGE || "EventosLog!A2:H").trim();
 
   const allowedGroupsRaw = (process.env.ALLOWED_GROUPS || process.env.ALLOWED_GROUP || "").trim();
   const allowedGroups = allowedGroupsRaw ? splitList(allowedGroupsRaw) : [];
@@ -106,6 +106,21 @@ function validateConfig(cfg) {
       errors.push(`ALLOWED_GROUPS inválido. Use JIDs terminando em @g.us. Problemas: ${bad.join(", ")}`);
     }
   }
+
+
+// Recomendação/compatibilidade de template:
+// Fase 2: logs com coluna de ID na coluna A (A2:H).
+// Em produção (strict), exigimos A2:H para evitar desalinhamento no append.
+const vendasOk = /^VendasLog!A\d+:H$/i.test(cfg.vendasRange) || /^VendasLog!A\d+:/i.test(cfg.vendasRange);
+const eventosOk = /^EventosLog!A\d+:H$/i.test(cfg.eventosRange) || /^EventosLog!A\d+:/i.test(cfg.eventosRange);
+
+if (cfg.strict) {
+  if (!vendasOk) errors.push("VENDASLOG_RANGE deve começar na coluna A (ex: VendasLog!A2:H).");
+  if (!eventosOk) errors.push("EVENTOSLOG_RANGE deve começar na coluna A (ex: EventosLog!A2:H).");
+} else {
+  if (!vendasOk) warns.push("Sugestão: use VENDASLOG_RANGE=VendasLog!A2:H (coluna A reservada para vendaId).");
+  if (!eventosOk) warns.push("Sugestão: use EVENTOSLOG_RANGE=EventosLog!A2:H (coluna A reservada para eventId).");
+}
 
   if (!(["qr", "pairing"].includes(cfg.waLoginMode))) {
     errors.push("WA_LOGIN_MODE deve ser 'qr' ou 'pairing'.");

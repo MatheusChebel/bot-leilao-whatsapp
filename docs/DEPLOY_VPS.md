@@ -93,3 +93,8 @@ pm2 logs bot-leilao --lines 200
 
 - Se pedir login de novo: apague `auth_info/` e refaça o login.
 - Se o bot não responde no grupo: verifique `ALLOWED_GROUPS` e use `!diag` (ADM).
+
+
+# Logs com ID (Fase 2)
+VENDASLOG_RANGE=VendasLog!A2:H
+EVENTOSLOG_RANGE=EventosLog!A2:H

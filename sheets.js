@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const { google } = require("googleapis");
 const { loadConfig } = require("./config");
@@ -43,6 +44,14 @@ function getSheetId() {
     throw new Error("SHEET_ID não definido no .env. Defina SHEET_ID com o ID da planilha.");
   }
   return cfg.sheetId;
+}
+
+
+function makeId(prefix) {
+  // Ex: EVT_kz2m3f_9f3a1c2b
+  const ts = Date.now().toString(36);
+  const rnd = crypto.randomBytes(4).toString("hex");
+  return `${prefix}_${ts}_${rnd}`;
 }
 
 function toNumber(v, fallback = 0) {
@@ -152,7 +161,11 @@ async function registrarVenda(venda) {
   const sheets = getSheetsClient();
   const spreadsheetId = getSheetId();
 
+  const vendaId = venda.vendaId || makeId("VEN");
+  venda.vendaId = vendaId;
+
   const linha = [
+    vendaId,
     venda.nomeComprador,
     venda.data,
     venda.hora,
@@ -181,12 +194,16 @@ function normalizeDetalhes(d) {
   try { return JSON.stringify(d); } catch { return String(d); }
 }
 
+
 function buildEventoRow(e) {
   const now = new Date();
   const data = e.data || now.toLocaleDateString("pt-BR");
   const hora = e.hora || now.toLocaleTimeString("pt-BR");
 
+  const eventId = e.eventId || makeId("EVT");
+
   return [
+    eventId,
     data,
     hora,
     e.evento || "",
@@ -196,6 +213,7 @@ function buildEventoRow(e) {
     normalizeDetalhes(e.detalhes),
   ];
 }
+
 
 async function registrarEvento(e) {
   return registrarEventosBatch([e]);

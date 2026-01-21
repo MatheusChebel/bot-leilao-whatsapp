@@ -1,6 +1,7 @@
 "use strict";
 
 const { registrarEventosBatch } = require("./sheets");
+const crypto = require("crypto");
 
 /**
  * Logger com:
@@ -20,6 +21,14 @@ const CFG = {
   backoffMaxMs: 30_000,
   maxDetalhesChars: 2500
 };
+
+function makeEventId(prefix = "EVT") {
+  const ts = Date.now().toString(36);
+  const rnd = crypto.randomBytes(4).toString("hex");
+  return `${prefix}_${ts}_${rnd}`;
+}
+
+
 
 let queue = [];
 let flushing = false;
@@ -62,7 +71,10 @@ function buildRow(level, event, data) {
       ? truncate(safeStringify(data.detalhes), CFG.maxDetalhesChars)
       : (data?.detalhesRaw ? truncate(String(data.detalhesRaw), CFG.maxDetalhesChars) : "");
 
+  const eventId = data?.eventId || makeEventId("EVT");
+
   return {
+    eventId,
     data: t.data,
     hora: t.hora,
     evento: event,
@@ -79,7 +91,7 @@ function buildRow(level, event, data) {
 
 function consolePrint(row) {
   const lvl = LEVELS[row.__level] || "INFO";
-  const base = `[${lvl}] ${row.data} ${row.hora} ${row.evento}`;
+  const base = `[${lvl}] ${row.data} ${row.hora} ${row.evento} (${row.eventId || "-"})`;
   console.log(base, {
     chatId: row.chatId,
     produtoId: row.produtoId,
