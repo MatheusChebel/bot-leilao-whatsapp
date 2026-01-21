@@ -1,18 +1,49 @@
 "use strict";
 
-const { google } = require("googleapis");
+const fs = require("fs");
 const path = require("path");
+const { google } = require("googleapis");
+const { loadConfig } = require("./config");
 
-const auth = new google.auth.GoogleAuth({
-  keyFile: path.join(__dirname, "credentials.json"),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
+let _client = null;
+let _cfg = null;
 
-const sheets = google.sheets({ version: "v4", auth });
+function getConfig() {
+  if (_cfg) return _cfg;
+  _cfg = loadConfig();
+  return _cfg;
+}
 
-// Você pode no futuro trocar para process.env.SHEET_ID, mas mantive como você já usa:
-const SPREADSHEET_ID = "1I8qCk2ZKLVOx0aV45DlFzqz2hCVFEXjib4Tn8Pp_ShM";
-const RANGE = "Página1!A2:K";
+function getSheetsClient() {
+  if (_client) return _client;
+  const cfg = getConfig();
+
+  const keyFile = cfg.credentialsPath;
+  if (!keyFile || !fs.existsSync(keyFile)) {
+    const err = new Error(`Credenciais Google não encontradas: ${keyFile || "(vazio)"}`);
+    err.code = "NO_GOOGLE_CREDENTIALS";
+    throw err;
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    keyFile,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+
+  _client = google.sheets({ version: "v4", auth });
+  return _client;
+}
+
+function getSheetId() {
+  const cfg = getConfig();
+  if (!cfg.sheetId) {
+    // Mantém compatibilidade com setups antigos: se não houver SHEET_ID,
+    // o bot ainda pode funcionar se o usuário hardcodar / ou definir LEGACY_SHEET_ID.
+    // Porém, em produção, recomenda-se sempre configurar SHEET_ID.
+    throw new Error("SHEET_ID não definido no .env. Defina SHEET_ID com o ID da planilha.");
+  }
+  return cfg.sheetId;
+}
 
 function toNumber(v, fallback = 0) {
   if (v === null || v === undefined) return fallback;
@@ -22,13 +53,26 @@ function toNumber(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function produtosSheetName() {
+  const cfg = getConfig();
+  const r = String(cfg.produtosRange || '').trim();
+  const bang = r.indexOf('!');
+  if (bang > 0) return r.slice(0, bang);
+  // fallback
+  return 'Página1';
+}
+
 // --------------------------------------
-// Carregar produtos
+// Produtos
 // --------------------------------------
 async function carregarProdutos() {
+  const cfg = getConfig();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
   const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: RANGE,
+    spreadsheetId,
+    range: cfg.produtosRange,
   });
 
   const rows = response.data.values || [];
@@ -48,15 +92,17 @@ async function carregarProdutos() {
   }));
 }
 
-// --------------------------------------
 async function getProdutoById(id) {
   const produtos = await carregarProdutos();
   const idNum = Number(id);
   return produtos.find((p) => Number(p.id) === idNum);
 }
 
-// --------------------------------------
 async function atualizarEstoque(id, novoValor) {
+  const cfg = getConfig();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
   const produtos = await carregarProdutos();
   const idNum = Number(id);
 
@@ -66,8 +112,8 @@ async function atualizarEstoque(id, novoValor) {
   const linha = index + 2;
 
   await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `Página1!F${linha}`,
+    spreadsheetId,
+    range: `${produtosSheetName()}!F${linha}`,
     valueInputOption: "USER_ENTERED",
     resource: { values: [[novoValor]] },
   });
@@ -76,8 +122,10 @@ async function atualizarEstoque(id, novoValor) {
   return true;
 }
 
-// --------------------------------------
 async function atualizarAtivo(id, ativo) {
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
   const produtos = await carregarProdutos();
   const idNum = Number(id);
 
@@ -87,8 +135,8 @@ async function atualizarAtivo(id, ativo) {
   const linha = index + 2;
 
   await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `Página1!J${linha}`,
+    spreadsheetId,
+    range: `${produtosSheetName()}!J${linha}`,
     valueInputOption: "USER_ENTERED",
     resource: { values: [[ativo ? "TRUE" : "FALSE"]] },
   });
@@ -97,9 +145,13 @@ async function atualizarAtivo(id, ativo) {
 }
 
 // --------------------------------------
-// Registrar venda
+// Vendas
 // --------------------------------------
 async function registrarVenda(venda) {
+  const cfg = getConfig();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
   const linha = [
     venda.nomeComprador,
     venda.data,
@@ -111,8 +163,8 @@ async function registrarVenda(venda) {
   ];
 
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: "VendasLog!A2:G",
+    spreadsheetId,
+    range: cfg.vendasRange,
     valueInputOption: "USER_ENTERED",
     resource: { values: [linha] },
   });
@@ -121,35 +173,45 @@ async function registrarVenda(venda) {
 }
 
 // --------------------------------------
-// Registrar evento (Observabilidade)
+// Eventos (Observabilidade)
 // --------------------------------------
-async function registrarEvento(e) {
-  // se não vier data/hora, calcula aqui (pt-BR)
+function normalizeDetalhes(d) {
+  if (d === undefined || d === null) return "";
+  if (typeof d === "string") return d;
+  try { return JSON.stringify(d); } catch { return String(d); }
+}
+
+function buildEventoRow(e) {
   const now = new Date();
   const data = e.data || now.toLocaleDateString("pt-BR");
   const hora = e.hora || now.toLocaleTimeString("pt-BR");
 
-  let detalhes = "";
-  if (e.detalhes !== undefined && e.detalhes !== null) {
-    if (typeof e.detalhes === "string") detalhes = e.detalhes;
-    else {
-      try { detalhes = JSON.stringify(e.detalhes); } catch { detalhes = String(e.detalhes); }
-    }
-  }
-
-  const values = [[
+  return [
     data,
     hora,
     e.evento || "",
     e.chatId || "",
     String(e.produtoId ?? ""),
     e.usuario || "",
-    detalhes
-  ]];
+    normalizeDetalhes(e.detalhes),
+  ];
+}
+
+async function registrarEvento(e) {
+  return registrarEventosBatch([e]);
+}
+
+async function registrarEventosBatch(eventos) {
+  const cfg = getConfig();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
+  const values = (Array.isArray(eventos) ? eventos : []).map(buildEventoRow);
+  if (values.length === 0) return true;
 
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: "EventosLog!A2:G",
+    spreadsheetId,
+    range: cfg.eventosRange,
     valueInputOption: "USER_ENTERED",
     resource: { values },
   });
@@ -164,4 +226,11 @@ module.exports = {
   atualizarAtivo,
   registrarVenda,
   registrarEvento,
+  registrarEventosBatch,
+
+  // testes
+  _test: {
+    buildEventoRow,
+    normalizeDetalhes
+  }
 };

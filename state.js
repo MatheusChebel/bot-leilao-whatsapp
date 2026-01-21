@@ -2,8 +2,11 @@
 
 const fs = require("fs");
 const path = require("path");
+const { loadConfig } = require("./config");
 
-const STATE_PATH = path.join(__dirname, "state.json");
+const cfg = loadConfig();
+const STATE_PATH = cfg.statePath || path.join(__dirname, "state.json");
+const STATE_TMP = `${STATE_PATH}.tmp`;
 
 const DEFAULT_STATE = () => ({
   // leilão atual
@@ -23,27 +26,36 @@ const DEFAULT_STATE = () => ({
   sequenciaPausada: false,
   filaIds: [],
   idx: 0,
-  duracaoMs: null
+  duracaoMs: null,
+
+  // suporte a retomada
+  autoChatId: null,
+  ultimoChatId: null,
+  leilaoFromAuto: false
 });
 
+function sanitizeProduto(p) {
+  if (!p) return null;
+  return {
+    id: p.id,
+    nome: p.nome,
+    numero: p.numero,
+    colecao: p.colecao,
+    qualidade: p.qualidade,
+    estoque: p.estoque,
+    preco: p.preco,
+    precoinicial: p.precoinicial,
+    imagem: p.imagem,
+    ativo: p.ativo,
+    arremate: p.arremate
+  };
+}
+
 function sanitizeState(st) {
-  // só grava campos serializáveis
   return {
     ativo: Boolean(st.ativo),
     pausado: Boolean(st.pausado),
-    produto: st.produto ? {
-      id: st.produto.id,
-      nome: st.produto.nome,
-      numero: st.produto.numero,
-      colecao: st.produto.colecao,
-      qualidade: st.produto.qualidade,
-      estoque: st.produto.estoque,
-      preco: st.produto.preco,
-      precoinicial: st.produto.precoinicial,
-      imagem: st.produto.imagem,
-      ativo: st.produto.ativo,
-      arremate: st.produto.arremate
-    } : null,
+    produto: sanitizeProduto(st.produto),
     maiorLance: Number(st.maiorLance) || 0,
     vencedor: st.vencedor || null,
     chatId: st.chatId || null,
@@ -51,33 +63,56 @@ function sanitizeState(st) {
     restanteMs: (st.restanteMs == null ? null : Number(st.restanteMs)),
     sequenciaAtiva: Boolean(st.sequenciaAtiva),
     sequenciaPausada: Boolean(st.sequenciaPausada),
-    filaIds: Array.isArray(st.filaIds) ? st.filaIds.map(Number).filter(n => Number.isFinite(n)) : [],
+    filaIds: Array.isArray(st.filaIds) ? st.filaIds.map(Number).filter(Number.isFinite) : [],
     idx: Number.isFinite(st.idx) ? st.idx : 0,
-    duracaoMs: (st.duracaoMs == null ? null : Number(st.duracaoMs))
+    duracaoMs: (st.duracaoMs == null ? null : Number(st.duracaoMs)),
+    autoChatId: st.autoChatId || null,
+    ultimoChatId: st.ultimoChatId || null,
+    leilaoFromAuto: Boolean(st.leilaoFromAuto)
   };
 }
 
-function loadState() {
+function ensureDirForFile(filePath) {
   try {
-    if (!fs.existsSync(STATE_PATH)) return DEFAULT_STATE();
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    // noop
+  }
+}
+
+function loadState() {
+  const base = DEFAULT_STATE();
+  try {
+    if (!fs.existsSync(STATE_PATH)) return base;
     const raw = fs.readFileSync(STATE_PATH, "utf-8");
     const parsed = JSON.parse(raw);
-
-    // merge defensivo
-    const base = DEFAULT_STATE();
-    return { ...base, ...parsed };
+    // merge + sanitize (garante tipos e defaults)
+    return sanitizeState({ ...base, ...parsed });
   } catch {
-    // se corromper, volta ao default
-    return DEFAULT_STATE();
+    // se corromper, preserva o arquivo para diagnóstico e volta ao default
+    try {
+      if (fs.existsSync(STATE_PATH)) {
+        const bak = `${STATE_PATH}.corrupt.${Date.now()}`;
+        fs.renameSync(STATE_PATH, bak);
+      }
+    } catch {}
+    return base;
   }
 }
 
 function saveState(st) {
   try {
+    ensureDirForFile(STATE_PATH);
     const payload = sanitizeState(st);
-    fs.writeFileSync(STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
+    const json = JSON.stringify(payload, null, 2);
+
+    // Escrita atômica: escreve tmp e renomeia
+    fs.writeFileSync(STATE_TMP, json, "utf-8");
+    fs.renameSync(STATE_TMP, STATE_PATH);
   } catch {
     // não travar o bot por falha de disco
+    try { if (fs.existsSync(STATE_TMP)) fs.unlinkSync(STATE_TMP); } catch {}
   }
 }
 
@@ -87,7 +122,7 @@ function clearStateFile() {
   } catch {}
 }
 
-// Compatibilidade: versões anteriores e o index.js esperam clearState().
+// Compatibilidade: versões anteriores esperam clearState().
 function clearState() {
   clearStateFile();
 }
@@ -97,5 +132,8 @@ module.exports = {
   saveState,
   clearStateFile,
   clearState,
-  DEFAULT_STATE
+  DEFAULT_STATE,
+
+  // expõe caminhos para debug/testes
+  __STATE_PATH: STATE_PATH
 };

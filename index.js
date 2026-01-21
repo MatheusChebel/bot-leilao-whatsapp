@@ -1,12 +1,23 @@
 "use strict";
 
-const path = require("path");
+const { loadConfig, validateConfig, maskConfigForLog } = require("./config");
 
-// Carrega variáveis do .env (necessário no PM2/produção quando o processo
-// não exporta as env vars diretamente). O cwd do PM2 deve apontar para a
-// pasta do client para funcionar corretamente.
-require("dotenv").config({ path: path.join(__dirname, ".env") });
-const BUILD_ID = "single-group-enforced-v2-2026-01-21";
+const CFG = loadConfig();
+const ENV_CHECK = validateConfig(CFG);
+if (ENV_CHECK.warns.length) {
+  for (const w of ENV_CHECK.warns) console.warn("[WARN] " + w);
+}
+if (!ENV_CHECK.ok) {
+  for (const e of ENV_CHECK.errors) console.error("[ERROR] " + e);
+  if (CFG.strict) {
+    console.error("[FATAL] Configuração inválida. Corrija o .env e reinicie.");
+    process.exit(1);
+  } else {
+    console.warn("[WARN] Configuração inválida, mas ENV_STRICT está desativado. O bot pode falhar em tempo de execução.");
+  }
+}
+console.log("🔧 Config carregada:", maskConfigForLog(CFG));
+
 const qrcode = require("qrcode-terminal");
 const { log } = require("./logger");
 const { loadState, saveState, clearState } = require("./state");
@@ -30,27 +41,6 @@ const {
 // =====================================================
 // CONFIG
 // =====================================================
-// Se quiser usar Pairing Code (ao invés de QR), coloque no PowerShell:
-// $env:WA_PHONE="55119XXXXXXXX"
-// e rode: node index.js
-const WA_PHONE = process.env.WA_PHONE || ""; // ex: 5511999999999 (DDI+DDD+NUMERO, sem +)
-
-// =====================================================
-// REGRA COMERCIAL: 1 GRUPO POR CLIENTE
-// =====================================================
-// - Configure no .env: ALLOWED_GROUPS=<chatId@g.us>
-// - Se vier mais de um separado por vírgula, somente o PRIMEIRO será usado.
-// - Se vazio/não definido, o bot responderá em qualquer chat (modo dev).
-const ALLOWED_GROUPS_RAW = (process.env.ALLOWED_GROUPS || process.env.ALLOWED_GROUP || "").trim();
-const ALLOWED_GROUP = ALLOWED_GROUPS_RAW
-  ? ALLOWED_GROUPS_RAW.split(",").map(s => s.trim()).filter(Boolean)[0]
-  : "";
-
-function isChatPermitido(chatId) {
-  // Se não configurado, não bloqueia (ambiente de desenvolvimento)
-  if (!ALLOWED_GROUP) return true;
-  return chatId === ALLOWED_GROUP;
-}
 
 // =====================================================
 // UTIL
@@ -84,6 +74,12 @@ function isGrupo(jid) {
   return typeof jid === "string" && jid.endsWith("@g.us");
 }
 
+function isAllowedGroup(chatId) {
+  if (!Array.isArray(CFG.allowedGroups) || CFG.allowedGroups.length === 0) return true;
+  return CFG.allowedGroups.includes(chatId);
+}
+
+
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
@@ -98,18 +94,6 @@ async function enviarComoDarLance(sock, chatId) {
 // =====================================================
 // MARCAR TODOS (MENTION ALL)
 // =====================================================
-async function isAdmin(sock, chatId, senderId) {
-  try {
-    if (!isGrupo(chatId)) return false;
-    const meta = await sock.groupMetadata(chatId);
-    const ps = Array.isArray(meta?.participants) ? meta.participants : [];
-    const me = ps.find(p => p?.id === senderId);
-    if (!me) return false;
-    return me.admin === "admin" || me.admin === "superadmin";
-  } catch {
-    return false;
-  }
-}
 
 async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
   if (!isGrupo(chatId)) {
@@ -924,13 +908,10 @@ function registrarHandlers(sock) {
     const pushName = m.pushName || "Participante";
     const text = extrairTexto(m);
 
-    // Regra comercial: bloquear qualquer interação fora do grupo permitido
-    // (1 grupo por cliente). Isso precisa acontecer ANTES de qualquer comando/log.
-    if (!isChatPermitido(chatId)) {
-      return;
-    }
-
     if (!text) return;
+
+    // Controle de grupo permitido
+    if (isGrupo(chatId) && !isAllowedGroup(chatId)) return;
 
     // =================================================
     // DURANTE LEILÃO (somente no chat do leilão)
@@ -956,6 +937,8 @@ function registrarHandlers(sock) {
 🧾 Gerais
 • !help / !ajuda
 • !ping
+• !diag  _(ADM: mostra chatId e infos úteis)_
+• !config  _(ADM: resumo do .env carregado)_
 • !marcar  _(ADM: marca todos para avisar do início do leilão)_
 
 📊 Status
@@ -1305,6 +1288,37 @@ function registrarHandlers(sock) {
       return;
     }
 
+    if (text === "!diag") {
+      const admin = await isAdmin(sock, chatId, senderId);
+      if (!admin) {
+        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !diag." });
+        return;
+      }
+
+      const uptimeMin = Math.floor(process.uptime() / 60);
+      const allowed = (Array.isArray(CFG.allowedGroups) && CFG.allowedGroups.length) ? CFG.allowedGroups.join(", ") : "(sem filtro)";
+
+      await sock.sendMessage(chatId, {
+        text: `🧩 *DIAG*
+
+• chatId: ${chatId}
+• éGrupo: ${isGrupo(chatId)}
+• allowedGroups: ${allowed}
+• uptime: ${uptimeMin} min`
+      });
+      return;
+    }
+
+    if (text === "!config") {
+      const admin = await isAdmin(sock, chatId, senderId);
+      if (!admin) {
+        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !config." });
+        return;
+      }
+      await sock.sendMessage(chatId, { text: "🔧 Config (resumida):\n" + JSON.stringify(maskConfigForLog(CFG), null, 2) });
+      return;
+    }
+
     if (text === "!help") {
       await sock.sendMessage(chatId, {
         text:
@@ -1313,6 +1327,8 @@ function registrarHandlers(sock) {
 🔎 Gerais
 • !help
 • !ping
+• !diag  _(ADM: mostra chatId e infos úteis)_
+• !config  _(ADM: resumo do .env carregado)_
 • !marcar  _(ADM: marca todos para avisar do início do leilão)_
 
 📋 Status
@@ -1723,6 +1739,11 @@ Use:
 async function conectarComReconexao() {
   await log("info", "BOT_START", { detalhes: { node: process.version } });
 
+  if (CFG.dryRun) {
+    console.log("🧪 DRY_RUN=true: iniciando sem conectar ao WhatsApp.");
+    return;
+  }
+
   const baileys = await import("@whiskeysockets/baileys");
   const makeWASocket = baileys.default;
 
@@ -1733,7 +1754,7 @@ async function conectarComReconexao() {
     DisconnectReason
   } = baileys;
 
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+  const { state, saveCreds } = await useMultiFileAuthState(CFG.authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log("🔧 WA Web version usada:", version, "isLatest:", isLatest);
 
@@ -1741,10 +1762,23 @@ async function conectarComReconexao() {
     auth: state,
     version,
     browser: Browsers.appropriate("Desktop"),
-    printQRInTerminal: false
+    printQRInTerminal: (CFG.waLoginMode === "qr")
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  // Pairing code (opcional)
+  if (CFG.waLoginMode === "pairing" && !state.creds.registered) {
+    try {
+      const code = await sock.requestPairingCode(CFG.waPhone);
+      console.log(`📲 Pairing Code: ${code}`);
+      console.log("Abra WhatsApp > Dispositivos conectados > Conectar dispositivo > 'Conectar com número' e digite o código.");
+      await log("info", "WA_PAIRING_CODE_GERADO", { detalhes: { phone: CFG.waPhone } });
+    } catch (e) {
+      console.error("❌ Falha ao gerar Pairing Code:", e?.message || String(e));
+      await log("error", "WA_PAIRING_CODE_FAIL", { detalhes: { message: e?.message || String(e) } });
+    }
+  }
 
   // handlers
   registrarHandlers(sock);
@@ -1753,13 +1787,11 @@ async function conectarComReconexao() {
   sock.ev.on("connection.update", async (update) => {
     const { qr, connection, lastDisconnect } = update;
 
-    if (qr) {
+    if (qr && CFG.waLoginMode === "qr") {
       console.log("📌 QR gerado (escaneie no WhatsApp)...");
       qrcode.generate(qr, { small: true });
 
-      await log("info", "WA_QR_GERADO", {
-        detalhes: { modo: WA_PHONE ? "pairing/qr" : "qr" }
-      });
+      await log("info", "WA_QR_GERADO", { detalhes: { modo: "qr" } });
     }
 
     if (connection) {
@@ -1838,7 +1870,7 @@ async function conectarComReconexao() {
       const boomStatus = lastDisconnect?.error?.output?.statusCode;
       const isLoggedOut =
         lastDisconnect?.error?.output?.payload?.statusCode === DisconnectReason?.loggedOut ||
-        boomStatus === 401;
+        false /* não tratar 401 genérico como loggedOut */;
 
       if (isLoggedOut) {
         console.log("⚠️ Sessão desconectada (logged out). Apague auth_info e rode novamente.");
@@ -1855,33 +1887,13 @@ async function conectarComReconexao() {
       conectarComReconexao().catch(console.error);
     }
 
-    // Pairing code (opcional)
-    if (WA_PHONE && connection === "open") {
-      // nada a fazer
-    }
   });
 
-  // Pairing code: se WA_PHONE estiver setado e ainda não houver credenciais válidas,
   // pede código (pode ser melhor que QR em alguns ambientes).
-  if (WA_PHONE && !state.creds.registered) {
-    try {
-      const code = await sock.requestPairingCode(WA_PHONE);
-      console.log("📲 Pairing Code:", code);
-      console.log("Abra WhatsApp > Dispositivos conectados > Conectar dispositivo > 'Conectar com número' e digite o código.");
+    // Este projeto usa login por QR Code (não usa pairing code).
+    // O QR será exibido via evento connection.update quando necessário.
 
-      await log("info", "WA_PAIRING_CODE_GERADO", {
-        detalhes: { phone: WA_PHONE }
-      });
-    } catch (e) {
-      console.error("❌ Falha ao solicitar pairing code:", e);
-
-      await log("error", "WA_PAIRING_CODE_ERRO", {
-        detalhes: { message: e?.message || String(e) }
-      });
-    }
-  }
-
-  console.log("✅ Bot iniciado. Se não estiver logado, o QR (ou pairing code) deve aparecer.");
+  console.log("✅ Bot iniciado. Se não estiver logado, o " + (CFG.waLoginMode === "pairing" ? "Pairing Code" : "QR") + " deve aparecer.");
 }
 
 conectarComReconexao().catch(async (err) => {
