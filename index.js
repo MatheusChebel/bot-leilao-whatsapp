@@ -902,6 +902,38 @@ function registrarHandlers(sock) {
 
     if (!text) return;
 
+    // -------------------------------------------------
+    // Operacional: descobrir chatId / validar que o handler está ativo
+    // -------------------------------------------------
+    if (text === "!chatid") {
+      await sock.sendMessage(chatId, {
+        text: `🧾 *Chat ID (remoteJid)*
+${chatId}
+
+👤 *Sender*
+${senderId}
+
+📌 *É grupo?* ${isGrupo(chatId) ? "Sim" : "Não"}`
+      });
+
+      await log("info", "CMD_CHATID", {
+        chatId,
+        usuario: pushName,
+        detalhes: { senderId, isGrupo: isGrupo(chatId) }
+      });
+      return;
+    }
+
+    // Log leve: registra apenas comandos (evita spam no Sheets)
+    if (text.startsWith("!")) {
+      await log("info", "CMD_RECEBIDO", {
+        chatId,
+        usuario: pushName,
+        detalhes: { senderId, texto: text.slice(0, 120), isGrupo: isGrupo(chatId) }
+      });
+    }
+
+
     // =================================================
     // DURANTE LEILÃO (somente no chat do leilão)
     // =================================================
