@@ -1,5 +1,12 @@
 "use strict";
 
+const path = require("path");
+
+// Carrega variáveis do .env (necessário no PM2/produção quando o processo
+// não exporta as env vars diretamente). O cwd do PM2 deve apontar para a
+// pasta do client para funcionar corretamente.
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+const BUILD_ID = "single-group-enforced-v2-2026-01-21";
 const qrcode = require("qrcode-terminal");
 const { log } = require("./logger");
 const { loadState, saveState, clearState } = require("./state");
@@ -28,9 +35,22 @@ const {
 // e rode: node index.js
 const WA_PHONE = process.env.WA_PHONE || ""; // ex: 5511999999999 (DDI+DDD+NUMERO, sem +)
 
-const ALLOWED_GROUP_RAW = process.env.ALLOWED_GROUPS || process.env.ALLOWED_GROUP || "";
-const ALLOWED_GROUP = parseAllowedGroup(ALLOWED_GROUP_RAW); // 1 grupo por cliente (se vier mais de 1, usa o primeiro)
+// =====================================================
+// REGRA COMERCIAL: 1 GRUPO POR CLIENTE
+// =====================================================
+// - Configure no .env: ALLOWED_GROUPS=<chatId@g.us>
+// - Se vier mais de um separado por vírgula, somente o PRIMEIRO será usado.
+// - Se vazio/não definido, o bot responderá em qualquer chat (modo dev).
+const ALLOWED_GROUPS_RAW = (process.env.ALLOWED_GROUPS || process.env.ALLOWED_GROUP || "").trim();
+const ALLOWED_GROUP = ALLOWED_GROUPS_RAW
+  ? ALLOWED_GROUPS_RAW.split(",").map(s => s.trim()).filter(Boolean)[0]
+  : "";
 
+function isChatPermitido(chatId) {
+  // Se não configurado, não bloqueia (ambiente de desenvolvimento)
+  if (!ALLOWED_GROUP) return true;
+  return chatId === ALLOWED_GROUP;
+}
 
 // =====================================================
 // UTIL
@@ -63,19 +83,6 @@ function extrairLance(texto) {
 function isGrupo(jid) {
   return typeof jid === "string" && jid.endsWith("@g.us");
 }
-
-function parseAllowedGroup(raw) {
-  const s = (raw || "").trim();
-  if (!s) return "";
-  // Aceita ALLOWED_GROUPS com múltiplos valores, mas por regra do produto usamos apenas 1 grupo por cliente.
-  // Se vier "a,b,c" (com ou sem espaços), pega somente o primeiro.
-  const first = s.split(",")[0].trim();
-  if (s.includes(",") && first) {
-    console.warn("[WARN] ALLOWED_GROUPS possui múltiplos valores; usando apenas o primeiro:", first);
-  }
-  return first;
-}
-
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -917,45 +924,13 @@ function registrarHandlers(sock) {
     const pushName = m.pushName || "Participante";
     const text = extrairTexto(m);
 
-    if (!text) return;
-
-
-    // Regra comercial: 1 grupo por cliente. Se ALLOWED_GROUP(S) estiver configurado, o bot ignora mensagens fora do grupo permitido.
-    if (ALLOWED_GROUP && chatId !== ALLOWED_GROUP) return;
-
-
-
-    // -------------------------------------------------
-    // Operacional: descobrir chatId / validar que o handler está ativo
-    // -------------------------------------------------
-    if (text === "!chatid") {
-      await sock.sendMessage(chatId, {
-        text: `🧾 *Chat ID (remoteJid)*
-${chatId}
-
-👤 *Sender*
-${senderId}
-
-📌 *É grupo?* ${isGrupo(chatId) ? "Sim" : "Não"}`
-      });
-
-      await log("info", "CMD_CHATID", {
-        chatId,
-        usuario: pushName,
-        detalhes: { senderId, isGrupo: isGrupo(chatId) }
-      });
+    // Regra comercial: bloquear qualquer interação fora do grupo permitido
+    // (1 grupo por cliente). Isso precisa acontecer ANTES de qualquer comando/log.
+    if (!isChatPermitido(chatId)) {
       return;
     }
 
-    // Log leve: registra apenas comandos (evita spam no Sheets)
-    if (text.startsWith("!")) {
-      await log("info", "CMD_RECEBIDO", {
-        chatId,
-        usuario: pushName,
-        detalhes: { senderId, texto: text.slice(0, 120), isGrupo: isGrupo(chatId) }
-      });
-    }
-
+    if (!text) return;
 
     // =================================================
     // DURANTE LEILÃO (somente no chat do leilão)
