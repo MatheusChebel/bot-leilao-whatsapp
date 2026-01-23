@@ -31,7 +31,16 @@ const DEFAULT_STATE = () => ({
   // suporte a retomada
   autoChatId: null,
   ultimoChatId: null,
-  leilaoFromAuto: false
+  leilaoFromAuto: false,
+
+  // controle do item atual no automático (não avançar idx antes de concluir)
+  autoCurrentId: null,
+  autoCurrentIdx: null,
+  autoCurrentVendaId: null,
+  autoCurrentStartedAt: null,
+
+  // venda pendente (garante registro no Sheets mesmo após queda)
+  pendingVenda: null
 });
 
 function sanitizeProduto(p) {
@@ -68,7 +77,16 @@ function sanitizeState(st) {
     duracaoMs: (st.duracaoMs == null ? null : Number(st.duracaoMs)),
     autoChatId: st.autoChatId || null,
     ultimoChatId: st.ultimoChatId || null,
-    leilaoFromAuto: Boolean(st.leilaoFromAuto)
+    leilaoFromAuto: Boolean(st.leilaoFromAuto),
+
+    // automático (item em andamento)
+    autoCurrentId: (st.autoCurrentId == null ? null : Number(st.autoCurrentId)),
+    autoCurrentIdx: (st.autoCurrentIdx == null ? null : Number(st.autoCurrentIdx)),
+    autoCurrentVendaId: st.autoCurrentVendaId || null,
+    autoCurrentStartedAt: st.autoCurrentStartedAt || null,
+
+    // venda pendente (para flush após queda)
+    pendingVenda: (st.pendingVenda && typeof st.pendingVenda === "object") ? st.pendingVenda : null
   };
 }
 

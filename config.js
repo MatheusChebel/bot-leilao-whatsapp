@@ -68,6 +68,7 @@ function loadConfig() {
   const dryRun = toBool(process.env.DRY_RUN, false);
 
   return {
+    timeZone: (process.env.TZ || process.env.TIMEZONE || process.env.BOT_TIMEZONE || 'America/Sao_Paulo').trim(),
     nodeEnv,
     strict,
     sheetId,
@@ -151,6 +152,7 @@ function maskConfigForLog(cfg) {
     eventosRange: cfg.eventosRange,
     allowedGroupsCount: cfg.allowedGroups.length,
     waLoginMode: cfg.waLoginMode,
+    timeZone: cfg.timeZone || null,
     waPhone: phoneMasked,
     statePath: cfg.statePath ? path.basename(cfg.statePath) : null,
     authDir: cfg.authDir ? path.basename(cfg.authDir) : null,

@@ -22,6 +22,9 @@ const qrcode = require("qrcode-terminal");
 const { log } = require("./logger");
 const { loadState, saveState, clearState } = require("./state");
 
+const crypto = require("crypto");
+const { nowParts } = require("./time");
+
 const {
   tempoMs,
   parseAutoIniciar,
@@ -84,11 +87,36 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function makeId(prefix) {
+  const ts = Date.now().toString(36);
+  const rnd = crypto.randomBytes(4).toString("hex");
+  return `${prefix}_${ts}_${rnd}`;
+}
+
+async function safeSend(sock, chatId, message, meta = {}) {
+  try {
+    return await sock.sendMessage(chatId, message);
+  } catch (e) {
+    try {
+      await log("warn", "WA_SEND_FAIL", {
+        chatId,
+        produtoId: meta.produtoId ?? "",
+        usuario: meta.usuario || "BOT",
+        detalhes: {
+          message: e?.message || String(e),
+          text: message?.text ? String(message.text).slice(0, 200) : undefined
+        }
+      });
+    } catch {}
+    return null;
+  }
+}
+
 const TEXTO_COMO_DAR_LANCE =
 `📌 *Como dar lance (novo padrão)*\n\nPara evitar lances acidentais, os lances agora precisam começar com a letra *L*.\n\n✅ Exemplos válidos:\n• *L20*\n• *l20*\n• *L 20*\n• *l  20*\n\nApenas mensagens nesse formato serão consideradas lances.`;
 
 async function enviarComoDarLance(sock, chatId) {
-  await sock.sendMessage(chatId, { text: TEXTO_COMO_DAR_LANCE });
+  await safeSend(sock, chatId, { text: TEXTO_COMO_DAR_LANCE });
 }
 
 // =====================================================
@@ -97,13 +125,13 @@ async function enviarComoDarLance(sock, chatId) {
 
 async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
   if (!isGrupo(chatId)) {
-    await sock.sendMessage(chatId, { text: "⚠️ Use !marcar dentro do grupo." });
+    await safeSend(sock, chatId, { text: "⚠️ Use !marcar dentro do grupo." });
     return { ok: false, motivo: "nao_grupo" };
   }
 
   const admin = await isAdmin(sock, chatId, senderId);
   if (!admin) {
-    await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !marcar." });
+    await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode usar !marcar." });
     return { ok: false, motivo: "nao_admin" };
   }
 
@@ -111,7 +139,7 @@ async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
   try {
     meta = await sock.groupMetadata(chatId);
   } catch (e) {
-    await sock.sendMessage(chatId, { text: "⚠️ Não consegui ler os membros do grupo agora. Tente novamente." });
+    await safeSend(sock, chatId, { text: "⚠️ Não consegui ler os membros do grupo agora. Tente novamente." });
     await log("warn", "MARCAR_FAIL_META", {
       chatId,
       usuario: pushName || "ADM",
@@ -124,7 +152,7 @@ async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
   const ids = participantes.map(p => p?.id).filter(Boolean);
 
   if (!ids.length) {
-    await sock.sendMessage(chatId, { text: "⚠️ Não encontrei participantes para marcar." });
+    await safeSend(sock, chatId, { text: "⚠️ Não encontrei participantes para marcar." });
     return { ok: false, motivo: "vazio" };
   }
 
@@ -141,7 +169,7 @@ async function marcarTodosNoGrupo(sock, chatId, senderId, pushName) {
       ? `${baseTexto}\n\n${tags}`
       : `📣 Continuação (${Math.min(i + CHUNK, total)}/${total})\n${tags}`;
 
-    await sock.sendMessage(chatId, { text: texto, mentions: chunk });
+    await safeSend(sock, chatId, { text: texto, mentions: chunk });
     if (i + CHUNK < ids.length) await sleep(600);
   }
 
@@ -258,7 +286,16 @@ const estadoInicial = () => ({
 
   // suporte a retomada após reinício
   autoChatId: null,
-  ultimoChatId: null
+  ultimoChatId: null,
+
+  // automático (item em andamento)
+  autoCurrentId: null,
+  autoCurrentIdx: null,
+  autoCurrentVendaId: null,
+  autoCurrentStartedAt: null,
+
+  // venda pendente (garante registro no Sheets após queda)
+  pendingVenda: null
 });
 
 let st = { ...estadoInicial(), ...loadState() };
@@ -269,7 +306,7 @@ let autoLoopRunning = false;
 
 function persist() {
   // se não existe nada ativo, limpa o state.json pra não confundir retomada
-  if (!st.ativo && !st.sequenciaAtiva) {
+  if (!st.ativo && !st.sequenciaAtiva && !st.pendingVenda) {
     clearState();
     return;
   }
@@ -297,6 +334,45 @@ function persist() {
   }
 
   saveState(toSave);
+}
+
+
+// Tenta finalizar venda pendente (ex.: queda durante o encerramento).
+// Idempotente pelo vendaId (VendasLog coluna A) e por atualizar estoque com valor absoluto.
+async function flushPendingVenda() {
+  if (!st.pendingVenda) return false;
+  const pv = st.pendingVenda;
+  try {
+    await registrarVenda({
+      vendaId: pv.vendaId,
+      nomeComprador: pv.nomeComprador,
+      data: pv.data,
+      hora: pv.hora,
+      produto: pv.produto,
+      valorFinal: pv.valorFinal,
+      foiArremate: pv.foiArremate
+    });
+    await atualizarEstoque(pv.produtoId, pv.novoEstoque);
+
+    st.pendingVenda = null;
+    persist();
+
+    await log("info", "PENDING_VENDA_FLUSH_OK", {
+      chatId: pv.chatId || "",
+      produtoId: pv.produtoId ?? "",
+      usuario: pv.nomeComprador || "",
+      detalhes: { vendaId: pv.vendaId, novoEstoque: pv.novoEstoque }
+    });
+    return true;
+  } catch (e) {
+    await log("warn", "PENDING_VENDA_FLUSH_FAIL", {
+      chatId: pv.chatId || "",
+      produtoId: pv.produtoId ?? "",
+      usuario: pv.nomeComprador || "",
+      detalhes: { vendaId: pv.vendaId, message: e?.message || String(e) }
+    });
+    return false;
+  }
 }
 
 
@@ -329,7 +405,7 @@ function agendarAvisosTempo(sock, chatId) {
   if (dur > 2 * 60 * 1000) {
     st.warn2mTimer = setTimeout(async () => {
       if (!st.ativo || st.pausado || st.chatId !== chatId) return;
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `⏳ *Faltam 2 minutos!*\n\n📦 ${nomeProduto(p)}\n💰 Lance atual: *R$${st.maiorLance}*\n✅ Lance padronizado: *L<valor>* (ex: *L20*)`
       });
@@ -340,7 +416,7 @@ function agendarAvisosTempo(sock, chatId) {
   if (dur > 10 * 1000) {
     st.warn10sTimer = setTimeout(async () => {
       if (!st.ativo || st.pausado || st.chatId !== chatId) return;
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `⏰ *ÚLTIMOS 10 SEGUNDOS!*\n\n📦 ${nomeProduto(p)}\n💰 Lance atual: *R$${st.maiorLance}*\n✅ Lance padronizado: *L<valor>* (ex: *L20*)`
       });
@@ -425,21 +501,21 @@ async function isAdmin(sock, chatId, senderId) {
 // =====================================================
 async function executarLeilao(sock, chatId, produto, duracaoMs, opts = {}) {
   if (st.ativo) {
-    await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+    await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
     return;
   }
   // Bloqueia apenas o leilão manual quando a sequência automática está ativa.
   if (st.sequenciaAtiva && !opts.fromAuto) {
-    await sock.sendMessage(chatId, { text: "⚠️ Sequência automática ativa. Não é possível iniciar leilão manual agora." });
+    await safeSend(sock, chatId, { text: "⚠️ Sequência automática ativa. Não é possível iniciar leilão manual agora." });
     return;
   }
 
   if (!produto) {
-    await sock.sendMessage(chatId, { text: "⚠️ Produto não encontrado ou inativo." });
+    await safeSend(sock, chatId, { text: "⚠️ Produto não encontrado ou inativo." });
     return;
   }
   if (produto.estoque <= 0) {
-    await sock.sendMessage(chatId, { text: "⚠️ estoque esgotado — produto será marcado como inativo." });
+    await safeSend(sock, chatId, { text: "⚠️ estoque esgotado — produto será marcado como inativo." });
 
     // LOG
     await log("warn", "AUTO_SKIP", {
@@ -485,7 +561,7 @@ async function executarLeilao(sock, chatId, produto, duracaoMs, opts = {}) {
     await enviarComoDarLance(sock, chatId);
   }
 
-  await sock.sendMessage(chatId, {
+  await safeSend(sock, chatId, {
     image: { url: produto.imagem },
     caption:
 `🔥 *LEILÃO INICIADO!*
@@ -515,6 +591,8 @@ Envie seu lance no formato: *L<valor>* (ex: *L20*).`
   const valorFinal = st.maiorLance;
   const foiArremate = arremate ? valorFinal >= arremate : false;
 
+  const fromAuto = st.leilaoFromAuto;
+
   // limpa estado do leilão atual
   st.pausado = false;
   st.produto = null;
@@ -540,19 +618,42 @@ Envie seu lance no formato: *L<valor>* (ex: *L20*).`
   });
 
   if (!vencedor) {
-    await sock.sendMessage(chatId, { text: "⏳ *LEILÃO ENCERRADO*\nNenhum lance recebido." });
+    await safeSend(sock, chatId, { text: "⏳ *LEILÃO ENCERRADO*\nNenhum lance recebido." });
     return;
   }
 
-  await sock.sendMessage(chatId, {
+  // Cria um vendaId estável para evitar duplicação em retries (principalmente no automático)
+  if (fromAuto && !st.autoCurrentVendaId) {
+    st.autoCurrentVendaId = makeId("VEN");
+    persist();
+  }
+
+  const t = nowParts();
+  const vendaId = fromAuto ? (st.autoCurrentVendaId || makeId("VEN")) : makeId("VEN");
+  const novoEstoque = Math.max(0, Number(produtoFinal.estoque) - 1);
+
+  // Persiste uma venda pendente ANTES de qualquer envio WA (para não perder registro em queda)
+  st.pendingVenda = {
+    vendaId,
+    chatId,
+    produtoId: produtoFinal.id,
+    novoEstoque,
+    nomeComprador: vencedor,
+    data: t.data,
+    hora: t.hora,
+    produto: nomeProduto(produtoFinal),
+    valorFinal,
+    foiArremate
+  };
+  persist();
+
+  await safeSend(sock, chatId, {
     text:
 `🏁 *LEILÃO ENCERRADO!*
 
 🏆 *Vencedor:* ${vencedor}
 💰 *Valor final:* R$${valorFinal}${foiArremate ? "\n🎯 *ARREMATE!*" : ""}`
-  });
-
-  const agora = new Date();
+  }, { produtoId: produtoFinal.id, usuario: vencedor });
 
   // LOG de venda
   await log("auction", foiArremate ? "ARREMATE" : "VENDA_REGISTRADA", {
@@ -562,21 +663,38 @@ Envie seu lance no formato: *L<valor>* (ex: *L20*).`
     detalhes: {
       produto: nomeProduto(produtoFinal),
       valorFinal,
-      data: agora.toLocaleDateString("pt-BR"),
-      hora: agora.toLocaleTimeString("pt-BR")
+      data: t.data,
+      hora: t.hora,
+      vendaId
     }
   });
 
-  await registrarVenda({
-    nomeComprador: vencedor,
-    data: agora.toLocaleDateString("pt-BR"),
-    hora: agora.toLocaleTimeString("pt-BR"),
-    produto: nomeProduto(produtoFinal),
-    valorFinal,
-    foiArremate
-  });
+  // Tenta registrar venda/estoque. Se falhar (queda), fica em pendingVenda para flush depois.
+  try {
+    await registrarVenda({
+      vendaId,
+      nomeComprador: vencedor,
+      data: t.data,
+      hora: t.hora,
+      produto: nomeProduto(produtoFinal),
+      valorFinal,
+      foiArremate
+    });
 
-  await atualizarEstoque(produtoFinal.id, produtoFinal.estoque - 1);
+    await atualizarEstoque(produtoFinal.id, novoEstoque);
+
+    st.pendingVenda = null;
+    if (fromAuto) st.autoCurrentVendaId = null;
+    persist();
+  } catch (e) {
+    await log("warn", "VENDA_PENDENTE", {
+      chatId,
+      produtoId: produtoFinal.id,
+      usuario: vencedor,
+      detalhes: { vendaId, message: e?.message || String(e) }
+    });
+  }
+
 }
 
 
@@ -624,7 +742,7 @@ async function runSequenciaLoop(sock, chatId) {
         st.filaIds.splice(st.idx, 1);
         persist();
 
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           text: `⚠️ Produto ${id} sem estoque. Pulando (não conta no progresso).`
         });
 
@@ -637,30 +755,68 @@ async function runSequenciaLoop(sock, chatId) {
         continue;
       }
 
-      // Agora sim: este item será leiloado. Contamos progresso.
-      st.idx++;
+      // Agora sim: este item será leiloado. NÃO avançamos idx antes de concluir.
+      st.autoCurrentId = id;
+      st.autoCurrentIdx = st.idx;
+      st.autoCurrentStartedAt = Date.now();
+      if (!st.autoCurrentVendaId) st.autoCurrentVendaId = makeId("VEN");
       persist();
 
-      await executarLeilao(sock, chatId, produto, st.duracaoMs, { fromAuto: true });
+      try {
+        await executarLeilao(sock, chatId, produto, st.duracaoMs, { fromAuto: true });
+      } catch (e) {
+        // Pausa e não avança; ADM pode usar !retomar para continuar o mesmo item
+        st.sequenciaPausada = true;
+        persist();
+        await log("warn", "AUTO_PAUSED_ERROR", {
+          chatId,
+          produtoId: id,
+          usuario: "BOT",
+          detalhes: { message: e?.message || String(e) }
+        });
+        await safeSend(sock, chatId, { text: `⚠️ Sequência pausada por instabilidade no item ${id}. Use *!retomar* (ADM) para continuar.` });
+        return;
+      }
+
+      // Concluiu o item com segurança: agora sim avançamos o idx
+      st.idx++;
+      st.autoCurrentId = null;
+      st.autoCurrentIdx = null;
+      st.autoCurrentStartedAt = null;
+      st.autoCurrentVendaId = null;
+      persist();
     }
 
     const terminou = st.idx >= st.filaIds.length;
 
-    st.sequenciaAtiva = false;
-    st.sequenciaPausada = false;
-    st.filaIds = [];
-    st.idx = 0;
-    st.duracaoMs = null;
+    // Se terminou naturalmente, encerra e limpa. Se foi pausada por erro, mantém state para !retomar.
+    if (terminou || !st.sequenciaAtiva) {
+      st.sequenciaAtiva = false;
+      st.sequenciaPausada = false;
+      st.filaIds = [];
+      st.idx = 0;
+      st.duracaoMs = null;
+      st.autoCurrentId = null;
+      st.autoCurrentIdx = null;
+      st.autoCurrentVendaId = null;
+      st.autoCurrentStartedAt = null;
+      persist();
 
-    await log("auction", terminou ? "AUTO_END" : "AUTO_CANCEL", {
+      await log("auction", terminou ? "AUTO_END" : "AUTO_CANCEL", {
       chatId,
       usuario: "BOT",
       detalhes: { terminou }
     });
 
-    await sock.sendMessage(chatId, { text: terminou ? "✅ Sequência automática finalizada." : "🛑 Sequência automática interrompida." });
+    await safeSend(sock, chatId, { text: terminou ? "✅ Sequência automática finalizada." : "🛑 Sequência automática interrompida." });
 
-    persist();
+      // state já persistido acima
+    }
+
+    // Se não terminou e continua ativa, está pausada por erro e aguarda !retomar.
+    if (st.sequenciaAtiva && !terminou) {
+      persist();
+    }
   } finally {
     autoLoopRunning = false;
   }
@@ -719,8 +875,9 @@ async function retomarSequenciaAutomatica(sock, chatId, usuario) {
     detalhes: { idx: st.idx, total: st.filaIds.length, duracaoMs: st.duracaoMs }
   });
 
-  await sock.sendMessage(st.autoChatId || chatId, {
-    text: `🔁 Retomando sequência automática do ponto ${st.idx + 1}/${st.filaIds.length}.`
+  const curId = (st.autoCurrentId != null) ? st.autoCurrentId : st.filaIds[st.idx];
+  await safeSend(sock, st.autoChatId || chatId, {
+    text: `🔁 Retomando sequência automática do ponto ${st.idx + 1}/${st.filaIds.length} (ID atual: ${curId}).`
   });
 
   await runSequenciaLoop(sock, st.autoChatId || chatId);
@@ -733,11 +890,11 @@ async function retomarSequenciaAutomatica(sock, chatId, usuario) {
 // =====================================================
 async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs) {
   if (st.ativo) {
-    await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+    await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
     return;
   }
   if (st.sequenciaAtiva) {
-    await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
+    await safeSend(sock, chatId, { text: "⚠️ A sequência automática já está ativa." });
     return;
   }
 
@@ -750,7 +907,7 @@ async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs)
   }
 
   if (fila.length === 0) {
-    await sock.sendMessage(chatId, { text: "⚠️ Nenhum item com estoque disponível nesse intervalo. Sequência não iniciada." });
+    await safeSend(sock, chatId, { text: "⚠️ Nenhum item com estoque disponível nesse intervalo. Sequência não iniciada." });
     await log("warn", "AUTO_START_EMPTY", {
       chatId,
       usuario: "ADM",
@@ -774,7 +931,7 @@ async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs)
     detalhes: { idIni, idFim, duracaoMs, total: fila.length }
   });
 
-  await sock.sendMessage(chatId, {
+  await safeSend(sock, chatId, {
     text: `🤖 Sequência automática iniciada: ${idIni} até ${idFim} (${Math.ceil(duracaoMs / 60000)} min cada).\n📦 Itens com estoque no momento do start: *${fila.length}*.`
   });
 
@@ -796,7 +953,7 @@ async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs)
     st.autoChatId = null;
     persist();
 
-    await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático. Sequência interrompida." });
+    await safeSend(sock, chatId, { text: "❌ Erro no leilão automático. Sequência interrompida." });
   });
 }
 
@@ -807,17 +964,17 @@ async function iniciarSequenciaAutomatica(sock, chatId, idIni, idFim, duracaoMs)
 // Ex: !leilao espec 1 6 9 10 25 10m
 async function iniciarSequenciaAutomaticaEspec(sock, chatId, ids, duracaoMs) {
   if (st.ativo) {
-    await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+    await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
     return;
   }
   if (st.sequenciaAtiva) {
-    await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
+    await safeSend(sock, chatId, { text: "⚠️ A sequência automática já está ativa." });
     return;
   }
 
   const lista = Array.isArray(ids) ? ids : [];
   if (lista.length === 0) {
-    await sock.sendMessage(chatId, { text: "⚠️ Informe ao menos 1 ID." });
+    await safeSend(sock, chatId, { text: "⚠️ Informe ao menos 1 ID." });
     return;
   }
 
@@ -836,7 +993,7 @@ async function iniciarSequenciaAutomaticaEspec(sock, chatId, ids, duracaoMs) {
   }
 
   if (fila.length === 0) {
-    await sock.sendMessage(chatId, { text: "⚠️ Nenhum dos IDs informados tem estoque disponível no momento. Sequência não iniciada." });
+    await safeSend(sock, chatId, { text: "⚠️ Nenhum dos IDs informados tem estoque disponível no momento. Sequência não iniciada." });
     await log("warn", "AUTO_ESPEC_START_EMPTY", {
       chatId,
       usuario: "ADM",
@@ -872,7 +1029,7 @@ async function iniciarSequenciaAutomaticaEspec(sock, chatId, ids, duracaoMs) {
     const preview = ignorados.slice(0, 12).join(", ");
     msg += `\n⚠️ Ignorados (inativo/sem estoque): ${preview}${ignorados.length > 12 ? "..." : ""}`;
   }
-  await sock.sendMessage(chatId, { text: msg });
+  await safeSend(sock, chatId, { text: msg });
 
   runSequenciaLoop(sock, chatId).catch(async (e) => {
     console.error("❌ Erro no automático (espec):", e);
@@ -891,7 +1048,7 @@ async function iniciarSequenciaAutomaticaEspec(sock, chatId, ids, duracaoMs) {
     st.autoChatId = null;
     persist();
 
-    await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
+    await safeSend(sock, chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
   });
 }
 
@@ -921,7 +1078,7 @@ function registrarHandlers(sock) {
       // Comandos globais que DEVEM funcionar mesmo durante leilão
       // -------------------------------------------------
       if (text === "!status" || text === "!leilao status") {
-        await sock.sendMessage(chatId, { text: statusTexto() });
+        await safeSend(sock, chatId, { text: statusTexto() });
         return;
       }
 
@@ -931,7 +1088,7 @@ function registrarHandlers(sock) {
       }
 
       if (text === "!help" || text === "!ajuda") {
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           text: `📌 *Comandos do Bot de Leilões*
 
 🧾 Gerais
@@ -983,7 +1140,7 @@ function registrarHandlers(sock) {
       if (text === "!retomar" || text === "!leilao retomar" || text === "!leilao auto retomar") {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode retomar." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode retomar." });
           return;
         }
 
@@ -995,7 +1152,7 @@ function registrarHandlers(sock) {
             state_invalido: "⚠️ Não foi possível retomar (state inválido).",
             duracao_invalida: "⚠️ Não foi possível retomar (duração inválida no state)."
           }[res.motivo] || "⚠️ Não foi possível retomar a sequência.";
-          await sock.sendMessage(chatId, { text: msg });
+          await safeSend(sock, chatId, { text: msg });
         }
         return;
       }
@@ -1015,15 +1172,15 @@ function registrarHandlers(sock) {
       if (setDurDuring) {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode ajustar a duração do automático." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode ajustar a duração do automático." });
           return;
         }
         if (!st.sequenciaAtiva) {
-          await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
+          await safeSend(sock, chatId, { text: "⚠️ Não há sequência automática ativa." });
           return;
         }
         if (!setDurDuring.duracaoMs) {
-          await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
+          await safeSend(sock, chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
           return;
         }
 
@@ -1039,7 +1196,7 @@ function registrarHandlers(sock) {
           detalhes: { before, after: st.duracaoMs, during: true }
         });
 
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           text:
 `✅ *Duração do automático atualizada*
 
@@ -1054,17 +1211,17 @@ function registrarHandlers(sock) {
       if (goDuring) {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode alterar a posição do automático." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode alterar a posição do automático." });
           return;
         }
         if (!st.sequenciaAtiva) {
-          await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
+          await safeSend(sock, chatId, { text: "⚠️ Não há sequência automática ativa." });
           return;
         }
 
         const total = Array.isArray(st.filaIds) ? st.filaIds.length : 0;
         if (!total) {
-          await sock.sendMessage(chatId, { text: "⚠️ State inválido (fila vazia)." });
+          await safeSend(sock, chatId, { text: "⚠️ State inválido (fila vazia)." });
           return;
         }
 
@@ -1082,7 +1239,7 @@ function registrarHandlers(sock) {
         });
 
         const proximoId = st.idx < total ? st.filaIds[st.idx] : null;
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           text:
 `🧭 *Posição do automático atualizada*
 
@@ -1098,11 +1255,11 @@ function registrarHandlers(sock) {
       if (text.toLowerCase() === "!leilao pular") {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode pular o item atual." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode pular o item atual." });
           return;
         }
         if (!st.sequenciaAtiva || !st.leilaoFromAuto) {
-          await sock.sendMessage(chatId, { text: "⚠️ Este comando só funciona durante um leilão automático. Use *!leilao cancelar* para encerrar um leilão manual." });
+          await safeSend(sock, chatId, { text: "⚠️ Este comando só funciona durante um leilão automático. Use *!leilao cancelar* para encerrar um leilão manual." });
           return;
         }
 
@@ -1115,13 +1272,13 @@ function registrarHandlers(sock) {
 
         // Cancela apenas o leilão atual e mantém a sequência ativa.
         cancelarLeilaoAtual();
-        await sock.sendMessage(chatId, { text: "⏭️ *Item atual pulado.* Indo para o próximo item da sequência automática..." });
+        await safeSend(sock, chatId, { text: "⏭️ *Item atual pulado.* Indo para o próximo item da sequência automática..." });
         return;
       }
       if (text === "!leilao cancelar") {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode cancelar o leilão." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode cancelar o leilão." });
           return;
         }
 
@@ -1145,7 +1302,7 @@ function registrarHandlers(sock) {
         }
 
         cancelarLeilaoAtual();
-        await sock.sendMessage(chatId, { text: "🛑 *Operação cancelada. Nenhum vencedor será registrado.*" });
+        await safeSend(sock, chatId, { text: "🛑 *Operação cancelada. Nenhum vencedor será registrado.*" });
         if (wasAuto) await sock.sendMessage(chatId, { text: "🛑 Sequência automática encerrada." });
         return;
       }
@@ -1153,11 +1310,11 @@ function registrarHandlers(sock) {
       if (text === "!leilao pausar") {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode pausar o leilão." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode pausar o leilão." });
           return;
         }
         if (!pausarLeilaoAtual()) {
-          await sock.sendMessage(chatId, { text: "⚠️ Não há leilão ativo para pausar." });
+          await safeSend(sock, chatId, { text: "⚠️ Não há leilão ativo para pausar." });
           return;
         }
 
@@ -1167,18 +1324,18 @@ function registrarHandlers(sock) {
           usuario: pushName
         });
 
-        await sock.sendMessage(chatId, { text: "⏸️ *Leilão pausado.*" });
+        await safeSend(sock, chatId, { text: "⏸️ *Leilão pausado.*" });
         return;
       }
 
       if (text === "!leilao despausar") {
         const admin = await isAdmin(sock, chatId, senderId);
         if (!admin) {
-          await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode despausar o leilão." });
+          await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode despausar o leilão." });
           return;
         }
         if (!retomarLeilaoAtual(sock, chatId)) {
-          await sock.sendMessage(chatId, { text: "⚠️ Leilão não está pausado." });
+          await safeSend(sock, chatId, { text: "⚠️ Leilão não está pausado." });
           return;
         }
 
@@ -1189,7 +1346,7 @@ function registrarHandlers(sock) {
         });
 
         const p = st.produto;
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           image: { url: p.imagem },
           caption:
 `▶️ *LEILÃO DESPAUSADO!*
@@ -1204,7 +1361,7 @@ function registrarHandlers(sock) {
       }
 
       if (st.pausado) {
-        await sock.sendMessage(chatId, { text: "⏸️ Leilão pausado. Aguarde despausar." });
+        await safeSend(sock, chatId, { text: "⏸️ Leilão pausado. Aguarde despausar." });
         return;
       }
 
@@ -1226,7 +1383,7 @@ function registrarHandlers(sock) {
             detalhes: { lance, minimo, atual: st.maiorLance }
           });
 
-          await sock.sendMessage(chatId, {
+          await safeSend(sock, chatId, {
             text:
 `⚠️ *Lance inválido*
 
@@ -1246,7 +1403,7 @@ function registrarHandlers(sock) {
           detalhes: { lance }
         });
 
-        await sock.sendMessage(chatId, {
+        await safeSend(sock, chatId, {
           text:
 `💥 *NOVO LÍDER!*
 👤 ${st.vencedor}
@@ -1262,7 +1419,7 @@ function registrarHandlers(sock) {
             detalhes: { lance, arremate }
           });
 
-          await sock.sendMessage(chatId, {
+          await safeSend(sock, chatId, {
             text:
 `🎯 *ARREMATE CONFIRMADO!*
 
@@ -1284,21 +1441,21 @@ function registrarHandlers(sock) {
     if (!text.startsWith("!")) return;
 
     if (text === "!ping") {
-      await sock.sendMessage(chatId, { text: "pong" });
+      await safeSend(sock, chatId, { text: "pong" });
       return;
     }
 
     if (text === "!diag") {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !diag." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode usar !diag." });
         return;
       }
 
       const uptimeMin = Math.floor(process.uptime() / 60);
       const allowed = (Array.isArray(CFG.allowedGroups) && CFG.allowedGroups.length) ? CFG.allowedGroups.join(", ") : "(sem filtro)";
 
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text: `🧩 *DIAG*
 
 • chatId: ${chatId}
@@ -1312,15 +1469,15 @@ function registrarHandlers(sock) {
     if (text === "!config") {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode usar !config." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode usar !config." });
         return;
       }
-      await sock.sendMessage(chatId, { text: "🔧 Config (resumida):\n" + JSON.stringify(maskConfigForLog(CFG), null, 2) });
+      await safeSend(sock, chatId, { text: "🔧 Config (resumida):\n" + JSON.stringify(maskConfigForLog(CFG), null, 2) });
       return;
     }
 
     if (text === "!help") {
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `🤖 *Comandos do Bot de Leilões*
 
@@ -1369,7 +1526,7 @@ function registrarHandlers(sock) {
     }
 
     if (text === "!status" || text === "!leilao status") {
-      await sock.sendMessage(chatId, { text: statusTexto() });
+      await safeSend(sock, chatId, { text: statusTexto() });
       return;
     }
 
@@ -1380,7 +1537,7 @@ function registrarHandlers(sock) {
 
     // comandos de leilão apenas em grupo
     if (!isGrupo(chatId)) {
-      await sock.sendMessage(chatId, { text: "⚠️ Use comandos de leilão dentro do grupo." });
+      await safeSend(sock, chatId, { text: "⚠️ Use comandos de leilão dentro do grupo." });
       return;
     }
 
@@ -1388,7 +1545,7 @@ function registrarHandlers(sock) {
     if (text === "!retomar" || text === "!leilao retomar" || text === "!leilao auto retomar") {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode retomar." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode retomar." });
         return;
       }
 
@@ -1401,7 +1558,7 @@ function registrarHandlers(sock) {
           duracao_invalida: "⚠️ Não foi possível retomar (duração inválida no state)."
         }[res.motivo] || "⚠️ Não foi possível retomar a sequência.";
 
-        await sock.sendMessage(chatId, { text: msg });
+        await safeSend(sock, chatId, { text: msg });
       }
       return;
     }
@@ -1410,17 +1567,17 @@ function registrarHandlers(sock) {
     if (text === "!leilao cancelar") {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode cancelar." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode cancelar." });
         return;
       }
 
       if (st.ativo) {
-        await sock.sendMessage(chatId, { text: "⚠️ Há um leilão ativo. Use !leilao cancelar no chat do leilão." });
+        await safeSend(sock, chatId, { text: "⚠️ Há um leilão ativo. Use !leilao cancelar no chat do leilão." });
         return;
       }
 
       if (!st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ Não há leilão ativo nem sequência automática para cancelar." });
+        await safeSend(sock, chatId, { text: "⚠️ Não há leilão ativo nem sequência automática para cancelar." });
         return;
       }
 
@@ -1433,7 +1590,7 @@ function registrarHandlers(sock) {
       st.sequenciaAtiva = false;
       st.sequenciaPausada = false;
       persist();
-      await sock.sendMessage(chatId, { text: "🛑 Sequência automática cancelada." });
+      await safeSend(sock, chatId, { text: "🛑 Sequência automática cancelada." });
       return;
     }
 
@@ -1442,7 +1599,7 @@ function registrarHandlers(sock) {
     // com !leilao pausar / !leilao despausar. Mantemos aqui apenas para não quebrar
     // quem já estava acostumado.
     if (text === "!leilao auto pausar" || text === "!leilao auto continuar") {
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `ℹ️ *Comando descontinuado*
 
@@ -1459,16 +1616,16 @@ Use:
     if (setDur) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode ajustar a duração do automático." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode ajustar a duração do automático." });
         return;
       }
       if (!st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
+        await safeSend(sock, chatId, { text: "⚠️ Não há sequência automática ativa." });
         return;
       }
 
       if (!setDur.duracaoMs) {
-        await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
+        await safeSend(sock, chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
         return;
       }
 
@@ -1484,7 +1641,7 @@ Use:
         detalhes: { before, after: st.duracaoMs }
       });
 
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `✅ *Duração atualizada*
 
@@ -1499,17 +1656,17 @@ Use:
     if (go) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode alterar a posição do automático." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode alterar a posição do automático." });
         return;
       }
       if (!st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ Não há sequência automática ativa." });
+        await safeSend(sock, chatId, { text: "⚠️ Não há sequência automática ativa." });
         return;
       }
 
       const total = Array.isArray(st.filaIds) ? st.filaIds.length : 0;
       if (!total) {
-        await sock.sendMessage(chatId, { text: "⚠️ State inválido (fila vazia)." });
+        await safeSend(sock, chatId, { text: "⚠️ State inválido (fila vazia)." });
         return;
       }
 
@@ -1527,7 +1684,7 @@ Use:
       });
 
       const proximoId = st.idx < total ? st.filaIds[st.idx] : null;
-      await sock.sendMessage(chatId, {
+      await safeSend(sock, chatId, {
         text:
 `🧭 *Posição atualizada*
 
@@ -1542,21 +1699,21 @@ Use:
     if (espec) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode iniciar leilão automático (espec)." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode iniciar leilão automático (espec)." });
         return;
       }
 
       if (st.ativo) {
-        await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+        await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
         return;
       }
       if (st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
+        await safeSend(sock, chatId, { text: "⚠️ A sequência automática já está ativa." });
         return;
       }
 
       if (!espec.duracaoMs) {
-        await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
+        await safeSend(sock, chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
         return;
       }
 
@@ -1583,7 +1740,7 @@ Use:
 
         st.sequenciaAtiva = false;
         st.sequenciaPausada = false;
-        await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
+        await safeSend(sock, chatId, { text: "❌ Erro no leilão automático (espec). Sequência interrompida." });
       });
 
       return;
@@ -1594,16 +1751,16 @@ Use:
     if (auto) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode iniciar leilão automático." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode iniciar leilão automático." });
         return;
       }
 
       if (st.ativo) {
-        await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+        await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
         return;
       }
       if (st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ A sequência automática já está ativa." });
+        await safeSend(sock, chatId, { text: "⚠️ A sequência automática já está ativa." });
         return;
       }
 
@@ -1612,11 +1769,11 @@ Use:
       const dur = auto.duracaoMs;
 
       if (!dur) {
-        await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
+        await safeSend(sock, chatId, { text: "⚠️ Tempo inválido. Use 30s, 10m, 1h, etc." });
         return;
       }
       if (idFim < idIni) {
-        await sock.sendMessage(chatId, { text: "⚠️ Intervalo inválido (final menor que inicial)." });
+        await safeSend(sock, chatId, { text: "⚠️ Intervalo inválido (final menor que inicial)." });
         return;
       }
 
@@ -1643,7 +1800,7 @@ Use:
 
         st.sequenciaAtiva = false;
         st.sequenciaPausada = false;
-        await sock.sendMessage(chatId, { text: "❌ Erro no leilão automático. Sequência interrompida." });
+        await safeSend(sock, chatId, { text: "❌ Erro no leilão automático. Sequência interrompida." });
       });
 
       return;
@@ -1654,16 +1811,16 @@ Use:
     if (manual) {
       const admin = await isAdmin(sock, chatId, senderId);
       if (!admin) {
-        await sock.sendMessage(chatId, { text: "⛔ Apenas ADM pode iniciar leilão." });
+        await safeSend(sock, chatId, { text: "⛔ Apenas ADM pode iniciar leilão." });
         return;
       }
 
       if (st.ativo) {
-        await sock.sendMessage(chatId, { text: "⚠️ Já existe um leilão em andamento." });
+        await safeSend(sock, chatId, { text: "⚠️ Já existe um leilão em andamento." });
         return;
       }
       if (st.sequenciaAtiva) {
-        await sock.sendMessage(chatId, { text: "⚠️ Sequência automática ativa. Não é possível iniciar leilão manual." });
+        await safeSend(sock, chatId, { text: "⚠️ Sequência automática ativa. Não é possível iniciar leilão manual." });
         return;
       }
 
@@ -1671,13 +1828,13 @@ Use:
       const dur = manual.duracaoMs;
 
       if (!dur) {
-        await sock.sendMessage(chatId, { text: "⚠️ Tempo inválido. Use 30m, 10m, 1h, etc." });
+        await safeSend(sock, chatId, { text: "⚠️ Tempo inválido. Use 30m, 10m, 1h, etc." });
         return;
       }
 
       const produto = await getProdutoById(id);
       if (!produto) {
-        await sock.sendMessage(chatId, { text: "⚠️ Produto não encontrado ou inativo." });
+        await safeSend(sock, chatId, { text: "⚠️ Produto não encontrado ou inativo." });
 
         await log("warn", "MANUAL_PRODUTO_NAO_ENCONTRADO", {
           chatId,
@@ -1688,7 +1845,7 @@ Use:
         return;
       }
       if (produto.estoque <= 0) {
-        await sock.sendMessage(chatId, { text: "⚠️ estoque esgotado — não vou iniciar o leilão." });
+        await safeSend(sock, chatId, { text: "⚠️ estoque esgotado — não vou iniciar o leilão." });
 
         await log("warn", "MANUAL_ESTOQUE_ESGOTADO", {
           chatId,
@@ -1721,14 +1878,14 @@ Use:
         });
 
         cancelarLeilaoAtual();
-        await sock.sendMessage(chatId, { text: "❌ Ocorreu um erro e o leilão foi interrompido." });
+        await safeSend(sock, chatId, { text: "❌ Ocorreu um erro e o leilão foi interrompido." });
       });
 
       return;
     }
 
     if (text.startsWith("!leilao")) {
-      await sock.sendMessage(chatId, { text: "⚠️ Comando inválido. Use !help para ver os comandos." });
+      await safeSend(sock, chatId, { text: "⚠️ Comando inválido. Use !help para ver os comandos." });
     }
   });
 }
@@ -1818,8 +1975,13 @@ async function conectarComReconexao() {
       });
     }
 
-    // Aviso de retomada (após reinício)
+    // Flush de venda pendente (pós-queda)
     if (connection === "open") {
+      try { await flushPendingVenda(); } catch {}
+
+      const isColdStart = process.uptime() < 120;
+      // Aviso de retomada (somente em boot real, não em reconexões)
+      if (!isColdStart) return;
       try {
         const targets = new Set();
         if (st.ativo && st.chatId) targets.add(st.chatId);

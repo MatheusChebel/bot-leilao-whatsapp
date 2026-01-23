@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const path = require("path");
 const { google } = require("googleapis");
 const { loadConfig } = require("./config");
+const { nowParts } = require("./time");
 
 let _client = null;
 let _cfg = null;
@@ -153,6 +154,32 @@ async function atualizarAtivo(id, ativo) {
   return true;
 }
 
+
+// --------------------------------------
+// Idempotência (Vendas)
+// --------------------------------------
+async function vendaJaRegistrada(vendaId) {
+  if (!vendaId) return false;
+  const cfg = getConfig();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
+  const sheetName = String(cfg.vendasRange || 'VendasLog!A2:H').split('!')[0] || 'VendasLog';
+  const range = `${sheetName}!A2:A`;
+
+  try {
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range });
+    const rows = resp?.data?.values || [];
+    for (const r of rows) {
+      if (!r || !r[0]) continue;
+      if (String(r[0]).trim() === String(vendaId).trim()) return true;
+    }
+    return false;
+  } catch {
+    // Se falhar a checagem, não bloqueia a venda (pode duplicar, mas não perde)
+    return false;
+  }
+}
 // --------------------------------------
 // Vendas
 // --------------------------------------
@@ -163,6 +190,13 @@ async function registrarVenda(venda) {
 
   const vendaId = venda.vendaId || makeId("VEN");
   venda.vendaId = vendaId;
+
+  const t = nowParts();
+  venda.data = venda.data || t.data;
+  venda.hora = venda.hora || t.hora;
+
+  // Idempotência: evita duplicar venda em caso de retry/queda
+  if (await vendaJaRegistrada(vendaId)) return true;
 
   const linha = [
     vendaId,
@@ -196,9 +230,9 @@ function normalizeDetalhes(d) {
 
 
 function buildEventoRow(e) {
-  const now = new Date();
-  const data = e.data || now.toLocaleDateString("pt-BR");
-  const hora = e.hora || now.toLocaleTimeString("pt-BR");
+  const t = nowParts();
+  const data = e.data || t.data;
+  const hora = e.hora || t.hora;
 
   const eventId = e.eventId || makeId("EVT");
 

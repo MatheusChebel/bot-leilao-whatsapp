@@ -2,6 +2,7 @@
 
 const { registrarEventosBatch } = require("./sheets");
 const crypto = require("crypto");
+const { nowParts } = require("./time");
 
 /**
  * Logger com:
@@ -42,11 +43,7 @@ const LEVELS = {
 };
 
 function nowPayload() {
-  const now = new Date();
-  return {
-    data: now.toLocaleDateString("pt-BR"),
-    hora: now.toLocaleTimeString("pt-BR")
-  };
+  return nowParts();
 }
 
 function safeStringify(obj) {
@@ -117,6 +114,7 @@ function backoffMs(tries) {
 
 function rowToEventoPayload(row) {
   return {
+    eventId: row.eventId,
     data: row.data,
     hora: row.hora,
     evento: row.evento,
