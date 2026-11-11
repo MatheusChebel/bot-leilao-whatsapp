@@ -1,86 +1,33 @@
-# Bot de Leilões WhatsApp (Zeraora TCG)
+# 🃏 Bot de Leilão para WhatsApp
 
-Bot para realizar leilões automáticos em grupos do WhatsApp, com catálogo e logs em **Google Sheets**.
+Bot que automatiza leilões de cartas Pokémon TCG e itens colecionáveis em grupos de WhatsApp. Criado para o grupo de vendas de um amigo (projeto BOT-TCG-ZERAORA), substituindo o leilão manual por um processo automático, organizado e seguro.
 
-## Visão geral
+## Funcionalidades
 
-- Leilão manual e sequência automática
-- Persistência local (`state.json`) para retomar progresso
-- Observabilidade em planilha (`EventosLog`) e registro de vendas (`VendasLog`)
-- Filtro por grupo permitido via `ALLOWED_GROUPS`
+- Leilões únicos ou programados, com vários itens rodando ao mesmo tempo
+- Agenda diária de leilões
+- Catálogo de produtos lido de uma planilha usada como base de dados
+- Controle de lances, vencedor e estoque
+- Comandos no chat com permissões: só administradores iniciam e gerenciam leilões
+- Tratamento de erros e regras de segurança para pagamento e controle de produto
 
-## Pré-requisitos
+## Como funciona
 
-- Node.js 20+
-- Conta de **Service Account** do Google com acesso de editor na planilha do cliente
-- VPS (opcional) se for rodar 24/7 (ex.: DigitalOcean)
+1. O bot roda em um servidor ligado a um número do WhatsApp Business.
+2. Esse número é adicionado ao grupo de vendas.
+3. O administrador manda um comando com o produto, e o bot busca os dados na planilha.
+4. O bot abre o leilão, recebe os lances no grupo e anuncia o vencedor ao final.
 
-## Instalação (local)
+## Tecnologias
 
-```bash
-npm ci
-cp .env.example .env
-# edite .env
-node index.js
-```
+- JavaScript [+ Node.js e a biblioteca de WhatsApp usada, ex.: whatsapp-web.js / Baileys]
+- Planilha Excel como base de dados
+- Servidor [nome/serviço de hospedagem]
 
-## Configuração (.env)
+## Desenvolvimento com IA
 
-Veja `.env.example`.
+Este projeto foi desenvolvido com apoio de LLMs (Claude e ChatGPT). Eu defini o problema e as regras do leilão, conduzi a IA com prompts, testei cada funcionalidade no grupo real, depurei os erros e fiz as integrações. A IA acelerou a escrita do código, e a lógica, os testes e as decisões ficaram comigo.
 
-**Obrigatórios:**
-- `SHEET_ID`
-- `GOOGLE_APPLICATION_CREDENTIALS` (ou `./credentials.json` na raiz)
+## Autor
 
-**Recomendados (produção):**
-- `ALLOWED_GROUPS` com o JID do grupo (termina em `@g.us`)
-- `WA_LOGIN_MODE=qr` (padrão)
-
-## Credenciais Google Sheets
-
-1. Crie/baixe o `credentials.json` (Service Account).
-2. Aponte o caminho no `.env`:
-   - `GOOGLE_APPLICATION_CREDENTIALS=/caminho/absoluto/credentials.json` (recomendado em VPS)
-   - ou `./credentials.json` (local)
-3. Compartilhe a planilha com o e-mail `client_email` da Service Account como **Editor**.
-
-## Comandos principais
-
-- `!help` / `!ajuda`
-- `!ping`
-- `!status` / `!leilao status`
-- `!diag` *(ADM: mostra chatId e infos úteis)*
-- `!config` *(ADM: resumo do .env carregado)*
-
-### Leilão manual (ADM)
-- `!leilao iniciar <id> <tempo>`
-
-### Sequência automática (ADM)
-- `!leilao auto iniciar <idIni> a <idFim> <tempo>`
-- `!leilao espec <id1> <id2> ... <tempo>`
-- `!leilao auto setduracao <tempo>`
-- `!leilao auto goto <posição>`
-
-## Deploy em VPS (PM2)
-
-Veja `docs/DEPLOY_VPS.md`.
-
-## Multi-cliente (recomendação)
-
-No início, para reduzir risco operacional:
-
-- **1 cliente = 1 pasta + 1 instância do PM2**
-- Cada pasta tem `.env`, `auth_info/` e `state.json` próprios.
-
-Exemplo:
-- `/opt/bot-leilao/clienteA`
-- `/opt/bot-leilao/clienteB`
-
-Use `ecosystem.config.js` como referência.
-
-## Testes
-
-```bash
-npm test
-npm run check
-```
+Matheus Chebel — [LinkedIn](https://www.linkedin.com/in/matheus-chebel)
